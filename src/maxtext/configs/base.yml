@@ -572,11 +572,19 @@ logical_axis_rules: [
                       ['activation_stage', 'stage'],
                       # General Weights
                       ['mlp', ['fsdp_transpose', 'tensor', 'tensor_sequence', 'autoregressive']],
+                      # Same as 'mlp' but without fsdp_transpose; used by the two-stage MLP-weight
+                      # all-gather (dense_fsdp_use_two_stage_all_gather) and by moe's
+                      # moe_fsdp_use_two_stage_all_gather to free the fsdp_transpose axis mid-gather.
+                      ['mlp_no_fsdp', ['tensor', 'tensor_sequence', 'autoregressive']],
                       # GDN (linear-attention) projections shard like 'mlp' during training; the
                       # vLLM serving config overrides this to match tpu-inference's ATTN_HEAD order.
                       ['gdn_head', ['fsdp_transpose', 'tensor', 'tensor_sequence', 'autoregressive']],
                       ['embed', ['fsdp', 'fsdp_transpose', 'context', 'expert']],
                       ['embed', ['fsdp', 'context', 'expert']],
+                      # Helper rule for dense_fsdp_use_two_stage_all_gather: pins the embed dim to
+                      # fsdp only (regardless of the sibling dim), so stage 1 of the two-stage
+                      # MLP-weight all-gather frees fsdp_transpose while keeping fsdp.
+                      ['embed_fsdp', ['fsdp']],
                       ['norm', ['tensor']],
                       ['layers', 'stage'],
                       ['diloco', 'diloco'],
@@ -605,7 +613,6 @@ logical_axis_rules: [
                       # ==========================================
                       # Deprecated / Scheduled for Removal
                       # ==========================================
-                      ['mlp_no_fsdp', ['tensor', 'tensor_sequence', 'autoregressive']],
                       ['exp_with_fsdp', 'fsdp'],
                   ]
 # Axes used for DCN must be earlier in this list than ICI, see (b/339009148) for details
@@ -652,6 +659,10 @@ check_vma: False
 
 # Enable ZeRO-1 optimizer sharding over data axis
 shard_optimizer_over_data: false
+
+# when dense MLP weight matrices are sharded on both fsdp and fsdp-transpose axes, use two separate all-gather calls
+# (see the embed_fsdp helper rule in logical_axis_rules above)
+dense_fsdp_use_two_stage_all_gather: false
 
 # Unless explicitly specified, the number of TPU slices is automatically determined. It should only be set for
 # disaggregated reinforcement learning workloads using multiple slices. For ahead of time compilation,
