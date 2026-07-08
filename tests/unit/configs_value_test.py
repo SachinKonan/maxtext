@@ -204,6 +204,28 @@ class ConfigTest(absltest.TestCase):
     with self.assertRaises(pydantic.ValidationError):
       pyconfig.initialize(argv)
 
+  def test_rl_config_namespace_separation(self):
+    """Tests that RL flags are rejected by MaxTextConfig but accepted by RLConfig."""
+    argv = [
+        "",
+        _BASE_CONFIG_PATH,
+        "run_name=test",
+        "grpo_beta=0.1",
+    ]
+    with self.assertRaises(ValueError):
+      pyconfig.initialize_pydantic(argv, config_class=types.MaxTextConfig)
+
+    _RL_CONFIG_PATH = os.path.join(maxtext_globals.MAXTEXT_CONFIGS_DIR, "post_train", "rl.yml")
+    rl_argv = [
+        "",
+        _RL_CONFIG_PATH,
+        "run_name=test",
+        "grpo_beta=0.1",
+    ]
+    rl_config = pyconfig.initialize_pydantic(rl_argv, config_class=types.RLConfig)
+    self.assertEqual(rl_config.grpo_beta, 0.1)
+    self.assertEqual(rl_config.rl.grpo_beta, 0.1)
+
 
 if __name__ == "__main__":
   absltest.main()

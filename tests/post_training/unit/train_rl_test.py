@@ -24,6 +24,7 @@ import jax
 from maxtext.trainers.post_train.rl import train_rl
 
 pytestmark = [pytest.mark.post_training]
+from maxtext.configs import types
 from maxtext.utils import model_creation_utils
 
 
@@ -64,7 +65,7 @@ class TrainRLTest(unittest.TestCase):
         ),
     ):
       trainer_config, sampler_config, trainer_devices, sampler_devices = model_creation_utils.setup_configs_and_devices(
-          ["dummy", "dummy"]
+          ["dummy", "dummy"], config_class=types.RLConfig
       )
 
       self.assertEqual(trainer_config, mock_config)
@@ -95,7 +96,9 @@ class TrainRLTest(unittest.TestCase):
             return_value=mock_config,
         ),
     ):
-      _, _, trainer_devices, sampler_devices = model_creation_utils.setup_configs_and_devices(["dummy", "dummy"])
+      _, _, trainer_devices, sampler_devices = model_creation_utils.setup_configs_and_devices(
+          ["dummy", "dummy"], config_class=types.RLConfig
+      )
 
       self.assertEqual(len(trainer_devices), 2)
       self.assertEqual(len(sampler_devices), 6)
@@ -125,7 +128,7 @@ class TrainRLTest(unittest.TestCase):
         ),
     ):
       with self.assertRaisesRegex(ValueError, "Not enough slices for trainer and samplers"):
-        model_creation_utils.setup_configs_and_devices(["dummy", "dummy"])
+        model_creation_utils.setup_configs_and_devices(["dummy", "dummy"], config_class=types.RLConfig)
 
   @pytest.mark.cpu_only
   def test_setup_configs_and_devices_multislice_invalid_tp(self):
@@ -152,7 +155,7 @@ class TrainRLTest(unittest.TestCase):
         ),
     ):
       with self.assertRaisesRegex(ValueError, "must be divisible by tensor parallelism"):
-        model_creation_utils.setup_configs_and_devices(["dummy", "dummy"])
+        model_creation_utils.setup_configs_and_devices(["dummy", "dummy"], config_class=types.RLConfig)
 
   @pytest.mark.cpu_only
   def test_setup_configs_and_devices_multislice_invalid_tp_fsdp(self):
@@ -179,7 +182,7 @@ class TrainRLTest(unittest.TestCase):
         ),
     ):
       with self.assertRaisesRegex(ValueError, "must equal devices_per_slice"):
-        model_creation_utils.setup_configs_and_devices(["dummy", "dummy"])
+        model_creation_utils.setup_configs_and_devices(["dummy", "dummy"], config_class=types.RLConfig)
 
   @pytest.mark.cpu_only
   def test_get_rollout_kwargs_no_dp(self):
