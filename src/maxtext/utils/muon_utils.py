@@ -70,7 +70,11 @@ def transform_logic(path: Tuple[str, ...]) -> Optional[mdn]:
   """
 
   # 1 Exclude parameters not suitable for Muon (scalar, embeddings, unembedding)
-  if _is_path_contain_any(("scale", "bias", "embedding", "logits_dense"), path):
+  if any(
+      any(x in segment for x in ("scale", "embedding", "logits_dense", "beta", "base", "sinks", "tid2eid", "inv_freq"))
+      or segment == "bias"
+      for segment in path
+  ):
     return None
 
   # 2 Special weights
@@ -86,9 +90,12 @@ def transform_logic(path: Tuple[str, ...]) -> Optional[mdn]:
     # Attention output projection: [0, L, -2, -1]
     if "out" in path:
       return mdn((0, -2), (-1,))
+    # Block-diagonal grouped linear layer: [n_groups, L, in_features_per_group, out_features_per_group]
+    elif "o_a_proj" in path:
+      return mdn((-2,), (-1,))
     # Attention qkv projection: [0, L, -2, -1]
     # MLA, exclude wq_a / wkv_a
-    elif _is_path_contain_any(("query", "key", "value", "wq_b", "wkv_b"), path):
+    elif _is_path_contain_any(("query", "key", "value", "wq_b", "wkv_b", "wkv"), path):
       return mdn((0,), (-2, -1))
 
   # 3 Standard weights, [0, L, -1]
@@ -182,7 +189,16 @@ def get_model_mdn(model_name, scan_layers=True, verbose=False, pure_nnx=False):
       f"scan_layers={scan_layers}",
       "attention=dot_product",
       f"pure_nnx={pure_nnx}",
+      "override_model_config=True",
+      "skip_jax_distributed_system=True",
   ]
+  if not pure_nnx:
+    argv.extend(
+        [
+            "enable_nnx=False",
+            "pure_nnx_decoder=False",
+        ]
+    )
   config = pyconfig.initialize(argv)
   # Setup model
   devices_array = maxtext_utils.create_device_mesh(config)
