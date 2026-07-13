@@ -2142,7 +2142,8 @@ class AttentionOp(nnx.Module):
       prefill_kv_cache, ar_kv_cache = cached_values[0], cached_values[1]
     if model_mode != MODEL_MODE_TRAIN:
       assert prefill_kv_cache
-      key, value, decoder_segment_ids = prefill_kv_cache
+      if self.attention_type != AttentionType.COMPRESSED:
+        key, value, decoder_segment_ids = prefill_kv_cache
 
     indexer_mask_prefill = None
     indexer_mask_ar = None
@@ -2177,7 +2178,12 @@ class AttentionOp(nnx.Module):
         return prefill_unnormalized_output / prefill_exponentials_sum
       return prefill_unnormalized_output
 
-    key, value, decoder_segment_ids, lengths = ar_kv_cache
+    if self.attention_type != AttentionType.COMPRESSED:
+        key, value, decoder_segment_ids, lengths = ar_kv_cache
+    else:
+        # Keep the passed-in key/value (which contain the compressed blocks), 
+        # but extract the lengths needed for ragged attention.
+        _, _, _, lengths = ar_kv_cache
 
     ar_unnormalized_output, ar_exponentials_max, ar_exponentials_sum = self.apply_attention(
         query=query,
@@ -2190,6 +2196,7 @@ class AttentionOp(nnx.Module):
         use_ragged_attention=self.use_ragged_attention,
         bidirectional_mask=bidirectional_mask,
         indexer_mask=indexer_mask_ar,
+        compressed_mask=compressed_mask,
         qk_product_einsum=self.AqtEinsum_2,
         wv_product_einsum=self.AqtEinsum_3,
     )
