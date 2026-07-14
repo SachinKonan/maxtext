@@ -1220,9 +1220,9 @@ class CompressedAttention(Attention):
     current_kv_cache = kv_cache
 
     # 1. Update the Local (Sliding Window) KV Cache with the uncompressed tokens
-    if model_mode != MODEL_MODE_TRAIN and self.KVCache_0 is not None:
+    if model_mode != MODEL_MODE_TRAIN and getattr(self, 'KVCache_0', None) is not None:
       current_kv_cache = self.update_kv_caches(
-          k, v, decoder_segment_ids, model_mode, kwargs.get("previous_chunk", None)
+          kv, kv, decoder_segment_ids, model_mode, kwargs.get("previous_chunk", None)
       )
 
     prefill_kv_cache = current_kv_cache[0] if current_kv_cache is not None else None
