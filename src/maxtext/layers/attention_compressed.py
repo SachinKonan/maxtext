@@ -546,16 +546,25 @@ class DeepseekV4Indexer(nnx.Module):
         
         if compressed_len > 0:
           cache_key_var = cache.cached_prefill_key
-          update_blocks = jnp.expand_dims(compressed, 2)
+          
+          # 1. Expand dims to [Batch, Seq, Heads, Dim]
+          update_blocks_raw = jnp.expand_dims(compressed, 2)
+          
+          # 2. Transpose to [Seq, Heads, Batch, Dim]
+          update_blocks = jnp.transpose(update_blocks_raw, cache.prefill_cache_axis_order)
+          
           operand_shape = cache_key_var.get_value().shape
-          if update_blocks.shape[2] < operand_shape[2]:
-              update_blocks = jnp.pad(update_blocks, ((0, 0), (0, 0), (0, operand_shape[2] - update_blocks.shape[2]), (0, 0)))
+          
+          # 3. Adjust padding logic to target the transposed axes
           if update_blocks.shape[3] < operand_shape[3]:
-              update_blocks = jnp.pad(update_blocks, ((0, 0), (0, 0), (0, 0), (0, operand_shape[3] - update_blocks.shape[3])))
+              pad_amt = operand_shape[3] - update_blocks.shape[3]
+              update_blocks = jnp.pad(update_blocks, ((0, 0), (0, 0), (0, 0), (0, pad_amt)))
           
           update_blocks = update_blocks[:, :operand_shape[1], ...]
+          
+          # 4. Insert along the Sequence axis (which is now axis=0)
           cache_key_var.set_value(
-              jax.lax.dynamic_update_slice_in_dim(cache_key_var.get_value(), update_blocks, 0, axis=1)
+              jax.lax.dynamic_update_slice_in_dim(cache_key_var.get_value(), update_blocks, 0, axis=0)
           )
           cache.entry_count.set_value(jnp.full((batch_size, 1), compressed_len, dtype=jnp.int32))
           
