@@ -40,6 +40,11 @@ def find_data_files(data_file_pattern):
   """Find data files matching the pattern."""
   if data_file_pattern.startswith("gs://"):
     data_files = gcs_utils.gcs_glob_pattern(data_file_pattern)
+  elif data_file_pattern.startswith("hf://"):
+    from huggingface_hub import HfFileSystem  # pylint: disable=import-outside-toplevel
+    fs = HfFileSystem()
+    stripped_pattern = data_file_pattern[len("hf://"):]
+    data_files = [f"hf://{f}" for f in fs.glob(stripped_pattern)]
   else:
     # Local files
     data_files = glob.glob(str(Path(data_file_pattern).expanduser().resolve()))
@@ -205,7 +210,7 @@ def get_datasets(
     if data_file_type == "tfrecord":
       dataset = dataset.map(input_pipeline_utils.make_tfrecord_iter_dataset)  # pyrefly: ignore[missing-attribute]
     else:
-      dataset = dataset.map(grain.experimental.ParquetIterDataset)  # pyrefly: ignore[missing-attribute]
+      dataset = dataset.map(input_pipeline_utils.make_parquet_iter_dataset)  # pyrefly: ignore[missing-attribute]
     cycle_length = min(files_per_host, grain_num_threads)
     dataset = grain.experimental.InterleaveIterDataset(dataset, cycle_length=cycle_length)
     if row_shard is not None:
