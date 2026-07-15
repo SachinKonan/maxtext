@@ -1012,6 +1012,11 @@ class KVCache(BaseCache):
 
     potential_update_key = compressed_block
 
+    operand_shape = self.cached_ar_key.get_value().shape
+    if potential_update_key.shape[3] < operand_shape[3]:
+      pad_amt = operand_shape[3] - potential_update_key.shape[3]
+      potential_update_key = jnp.pad(potential_update_key, ((0, 0), (0, 0), (0, 0), (0, pad_amt)))
+
     # If window incomplete, we will just write dummy zeros
     dummy_key = jnp.zeros_like(potential_update_key)
     update_key = jnp.where(window_complete, potential_update_key, dummy_key)

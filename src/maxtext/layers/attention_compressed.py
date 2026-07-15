@@ -282,7 +282,11 @@ class DeepseekV4HCACompressor(BaseDeepseekCompressor):
       compressed = compressed_full[:batch_size, :, 0, :comp_dim]
       
       compressed_kv = jnp.expand_dims(compressed, 2) # [B, N, 1, D]
-      compressed_mask = jnp.zeros((batch_size, 1, seq_len, compressed_kv.shape[1]), dtype=self.dtype)
+      compressed_len = compressed_kv.shape[1]
+      entry_indices = jnp.arange(compressed_len)
+      causal_threshold = (position_ids + 1) // self.compress_rate
+      future_mask = entry_indices[None, None, None, :] >= jnp.expand_dims(causal_threshold, axis=(1, 3))
+      compressed_mask = jnp.where(future_mask, DEFAULT_MASK_VALUE, 0.0).astype(self.dtype)
       
       return compressed_kv, compressed_mask
 
