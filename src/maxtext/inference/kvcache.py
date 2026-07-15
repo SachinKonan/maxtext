@@ -14,7 +14,7 @@
 
 """Implementation of the kvcache."""
 
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 
 import jax
 import jax.numpy as jnp
