@@ -280,16 +280,27 @@ class DeepseekV4HCACompressor(BaseDeepseekCompressor):
       
       # Restore back to original batch_size and strip RoPE/dummy head
       compressed = compressed_full[:batch_size, :, 0, :comp_dim]
-      
       compressed_kv = jnp.expand_dims(compressed, 2) # [B, N, 1, D]
-      compressed_len = compressed_kv.shape[1]
-      entry_indices = jnp.arange(compressed_len)
-      causal_threshold = (position_ids + 1) // self.compress_rate
-      future_mask = entry_indices[None, None, None, :] >= jnp.expand_dims(causal_threshold, axis=(1, 3))
-      compressed_mask = jnp.where(future_mask, DEFAULT_MASK_VALUE, 0.0).astype(self.dtype)
+      
+      # --- NEW VALIDITY MASK FOR AR MODE ---
+      # Explicitly track which indices in the padded JAX arrays contain REAL blocks
+      max_prefill_comp = cached_prefill[0].shape[1]
+      prefill_valid = cache.entry_count.get_value() # [B, 1]
+      ar_valid = jnp.expand_dims(cached_ar[3], axis=1) # [B, 1]
+      
+      entry_indices = jnp.arange(compressed_kv.shape[1])[None, None, None, :] # [1, 1, 1, L]
+      
+      is_prefill = entry_indices < max_prefill_comp
+      is_valid_prefill = is_prefill & (entry_indices < jnp.expand_dims(prefill_valid, axis=(1, 3)))
+      
+      is_ar = entry_indices >= max_prefill_comp
+      is_valid_ar = is_ar & ((entry_indices - max_prefill_comp) < jnp.expand_dims(ar_valid, axis=(1, 3)))
+      
+      is_valid = is_valid_prefill | is_valid_ar
+      compressed_mask = jnp.where(is_valid, 0.0, DEFAULT_MASK_VALUE).astype(self.dtype)
       
       return compressed_kv, compressed_mask
-
+    
     # --- PREFILL CHUNKING & PRIMING ---
     usable = (seq_len // self.compress_rate) * self.compress_rate
     chunk_kv = kv[:, :usable]
@@ -525,8 +536,23 @@ class DeepseekV4Indexer(nnx.Module):
       
       # Restore back to original batch_size and strip RoPE/dummy head
       compressed = compressed_full[:batch_size, :, 0, :comp_dim]
-      
       compressed_len = compressed.shape[1]
+      
+      # --- NEW VALIDITY MASK FOR AR MODE ---
+      max_prefill_comp = cached_prefill[0].shape[1]
+      prefill_valid = cache.entry_count.get_value() # [B, 1]
+      ar_valid = jnp.expand_dims(cached_ar[3], axis=1) # [B, 1]
+      
+      entry_indices = jnp.arange(compressed_len)[None, None, :] # [1, 1, L]
+      
+      is_prefill = entry_indices < max_prefill_comp
+      is_valid_prefill = is_prefill & (entry_indices < jnp.expand_dims(prefill_valid, axis=1))
+      
+      is_ar = entry_indices >= max_prefill_comp
+      is_valid_ar = is_ar & ((entry_indices - max_prefill_comp) < jnp.expand_dims(ar_valid, axis=1))
+      
+      is_valid = is_valid_prefill | is_valid_ar
+      future_mask = ~is_valid
     
     # --- PREFILL CHUNKING & PRIMING ---
     else:
@@ -622,17 +648,22 @@ class DeepseekV4Indexer(nnx.Module):
     index_scores = jnp.einsum("bhsw,bsh->bsw", scores, weights)
 
     k = min(self.index_topk, compressed_len)
-    causal_threshold = (position_ids + 1) // self.compress_rate
-    entry_indices = jnp.arange(compressed_len)
-    future_mask = entry_indices[None, None, :] >= jnp.expand_dims(causal_threshold, axis=-1)
+    
+    # --- ONLY RUN MATHEMATICAL CAUSAL MASK IN PREFILL ---
+    if model_mode != MODEL_MODE_AUTOREGRESSIVE:
+      causal_threshold = (position_ids + 1) // self.compress_rate
+      entry_indices_mask = jnp.arange(compressed_len)
+      future_mask = entry_indices_mask[None, None, :] >= jnp.expand_dims(causal_threshold, axis=-1)
 
+    # Apply the mask to the scores
     index_scores = jnp.where(future_mask, jnp.full_like(index_scores, -jnp.inf), index_scores)
 
     if attention_mask is not None:
       index_scores += attention_mask[:, :, :compressed_len]
 
     top_k_indices = jax.lax.top_k(index_scores, k)[1]
-    invalid = top_k_indices >= jnp.expand_dims(causal_threshold, axis=-1)
+    invalid = jnp.take_along_axis(future_mask, top_k_indices, axis=-1)
+    
     return jnp.where(invalid, jnp.full_like(top_k_indices, -1), top_k_indices)
 
 
