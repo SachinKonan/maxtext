@@ -971,6 +971,7 @@ class KVCache(BaseCache):
       value: Array,
       gate: Optional[Array] = None,
       use_ragged_attention: bool = False,
+      compressor_fn: Optional[Callable] = None,
   ):
     """DeepSeek-V4 aware token-by-token caching matrix (Functionally Pure for JAX tracing)."""
     if self.compress_rate == 1:
@@ -980,8 +981,6 @@ class KVCache(BaseCache):
     current_index_array = self.accumulator_index.get_value()
     current_index = jnp.reshape(current_index_array, (-1,))[0]
 
-    # THE FIX: Removed incorrect jnp.transpose(). The accumulation buffer 
-    # expects standard [Batch, Seq, Heads, Dim] format!
     buffer_kv = jax.lax.dynamic_update_slice_in_dim(
         self.leftover_buffer_kv.get_value(), key, current_index, 1
     )
@@ -995,12 +994,21 @@ class KVCache(BaseCache):
     next_index = current_index + 1
     window_complete = (next_index == self.compress_rate)
 
-    # 2. Unconditionally compute the compressed block 
-    gate_weights = jax.nn.softmax(buffer_gate, axis=1).astype(buffer_kv.dtype)
-    compressed_block = jnp.sum(buffer_kv * gate_weights, axis=1, keepdims=True)
+    # 2. Compute the compressed block using the layer's math callback
+    if compressor_fn is not None:
+        compressed_block, next_overlap_kv, next_overlap_gate = compressor_fn(buffer_kv, buffer_gate)
+        
+        # Conditionally update the overlap registers only if the window finished
+        new_overlap_kv = jnp.where(window_complete, next_overlap_kv, self.overlap_kv.get_value())
+        new_overlap_gate = jnp.where(window_complete, next_overlap_gate, self.overlap_gate.get_value())
+        self.overlap_kv.set_value(new_overlap_kv)
+        self.overlap_gate.set_value(new_overlap_gate)
+    else:
+        # Fallback
+        gate_weights = jax.nn.softmax(buffer_gate, axis=1).astype(buffer_kv.dtype)
+        compressed_block = jnp.sum(buffer_kv * gate_weights, axis=1, keepdims=True)
 
-    # THE FIX: Removed jnp.transpose(). `update_ar_key_value` handles TPU layouts internally.
-    potential_update_key = compressed_block 
+    potential_update_key = compressed_block
 
     # If window incomplete, we will just write dummy zeros
     dummy_key = jnp.zeros_like(potential_update_key)
@@ -1080,6 +1088,7 @@ class KVCache(BaseCache):
       use_ragged_attention: bool = False,
       previous_chunk: Any = None,
       gate: Optional[Array] = None,
+      compressor_fn: Optional[Callable] = None,
   ) -> tuple:
     """KV cache takes the current state and updates the state accordingly.
 
@@ -1105,7 +1114,7 @@ class KVCache(BaseCache):
         return self.kv_cache_prefill(key, value, decoder_segment_ids), None
     elif model_mode == MODEL_MODE_AUTOREGRESSIVE:
       if self.is_deepseek_v4 and self.compress_rate > 1:
-        return self.kv_cache_autoregressive_v4(key, value, gate, use_ragged_attention)
+        return self.kv_cache_autoregressive_v4(key, value, gate, use_ragged_attention, compressor_fn)
       return self.kv_cache_autoregressive(key, value, use_ragged_attention)
     else:
       raise ValueError(f"Model Mode isn't supported! {model_mode=}")

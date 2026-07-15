@@ -263,8 +263,16 @@ class DeepseekV4HCACompressor(BaseDeepseekCompressor):
               kv_exp = kv_exp[:target_batch]
               gate_exp = gate_exp[:target_batch]
       
+      def hca_compressor_fn(buf_kv, buf_gate):
+        gate_weights = jax.nn.softmax(buf_gate + self.position_bias.value[:, None, :], axis=1).astype(buf_kv.dtype)
+        compressed = self.kv_norm(jnp.sum(buf_kv * gate_weights, axis=1)) 
+        block_pos = position_ids - (self.compress_rate - 1)
+        compressed = self.rotary_emb(compressed, block_pos, unsqueeze_dim=None)
+        return jnp.expand_dims(compressed, 2), None, None
+
       cached_prefill, cached_ar = cache(
-          key=kv_exp, value=kv_exp, gate=gate_exp, decoder_segment_ids=None, model_mode=model_mode
+          key=kv_exp, value=kv_exp, gate=gate_exp, decoder_segment_ids=None, model_mode=model_mode,
+          compressor_fn=hca_compressor_fn
       )
 
       comp_dim = self.head_dim
@@ -487,10 +495,27 @@ class DeepseekV4Indexer(nnx.Module):
               gate_exp = gate_exp[:target_batch]
       # ------------------------------
 
-      cached_prefill, cached_ar = cache(
-          key=kv_exp, value=kv_exp, gate=gate_exp, decoder_segment_ids=None, model_mode=model_mode
-      )
+      def indexer_compressor_fn(buf_kv, buf_gate):
+        chunk_kv_reshaped = jnp.swapaxes(buf_kv, 1, 2)
+        chunk_gate_reshaped = jnp.swapaxes(buf_gate, 1, 2) + self.position_bias.value
+        
+        prior_kv = jnp.transpose(cache.overlap_kv.get_value(), (0, 2, 1, 3))
+        prior_gate = jnp.transpose(cache.overlap_gate.get_value(), (0, 2, 1, 3))
+        
+        compressed, next_prior_kv, next_prior_gate = csa_overlap_pooling(
+            chunk_kv_reshaped, chunk_gate_reshaped, self.kv_norm, self.index_head_dim, prior_kv, prior_gate
+        )
+        
+        block_pos = position_ids - (self.compress_rate - 1)
+        compressed = self.rotary_emb(compressed, block_pos, unsqueeze_dim=None)
+        
+        return jnp.expand_dims(compressed, 2), jnp.transpose(next_prior_kv, (0, 2, 1, 3)), jnp.transpose(next_prior_gate, (0, 2, 1, 3))
 
+      cached_prefill, cached_ar = cache(
+        key=kv_exp, value=kv_exp, gate=gate_exp, decoder_segment_ids=None, model_mode=model_mode,
+        compressor_fn=indexer_compressor_fn
+      )
+      
       comp_dim = self.index_head_dim
       compressed_full = jnp.concatenate([cached_prefill[0], cached_ar[0]], axis=1)
       
@@ -701,8 +726,25 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
               gate_exp = gate_exp[:target_batch]
       # ------------------------------
 
+      def csa_compressor_fn(buf_kv, buf_gate):
+        chunk_kv_reshaped = jnp.swapaxes(buf_kv, 1, 2)
+        chunk_gate_reshaped = jnp.swapaxes(buf_gate, 1, 2) + self.position_bias.value
+        
+        prior_kv = jnp.transpose(cache.overlap_kv.get_value(), (0, 2, 1, 3))
+        prior_gate = jnp.transpose(cache.overlap_gate.get_value(), (0, 2, 1, 3))
+        
+        compressed, next_prior_kv, next_prior_gate = csa_overlap_pooling(
+            chunk_kv_reshaped, chunk_gate_reshaped, self.kv_norm, self.head_dim, prior_kv, prior_gate
+        )
+        
+        block_pos = position_ids - (self.compress_rate - 1)
+        compressed = self.rotary_emb(compressed, block_pos, unsqueeze_dim=None)
+        
+        return jnp.expand_dims(compressed, 2), jnp.transpose(next_prior_kv, (0, 2, 1, 3)), jnp.transpose(next_prior_gate, (0, 2, 1, 3))
+
       cached_prefill, cached_ar = cache(
-          key=kv_exp, value=kv_exp, gate=gate_exp, decoder_segment_ids=None, model_mode=model_mode
+        key=kv_exp, value=kv_exp, gate=gate_exp, decoder_segment_ids=None, model_mode=model_mode,
+        compressor_fn=csa_compressor_fn
       )
 
       comp_dim = self.head_dim
