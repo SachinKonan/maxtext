@@ -996,17 +996,19 @@ class KVCache(BaseCache):
 
     # 2. Compute the compressed block using the layer's math callback
     if compressor_fn is not None:
-        compressed_block, next_overlap_kv, next_overlap_gate = compressor_fn(buffer_kv, buffer_gate)
-        
-        # Conditionally update the overlap registers only if the window finished
+      compressed_block, next_overlap_kv, next_overlap_gate = compressor_fn(buffer_kv, buffer_gate)
+      
+      # Conditionally update the overlap registers only if the window finished (and if the layer uses them!)
+      if next_overlap_kv is not None:
         new_overlap_kv = jnp.where(window_complete, next_overlap_kv, self.overlap_kv.get_value())
-        new_overlap_gate = jnp.where(window_complete, next_overlap_gate, self.overlap_gate.get_value())
         self.overlap_kv.set_value(new_overlap_kv)
+          
+      if next_overlap_gate is not None:
+        new_overlap_gate = jnp.where(window_complete, next_overlap_gate, self.overlap_gate.get_value())
         self.overlap_gate.set_value(new_overlap_gate)
     else:
-        # Fallback
-        gate_weights = jax.nn.softmax(buffer_gate, axis=1).astype(buffer_kv.dtype)
-        compressed_block = jnp.sum(buffer_kv * gate_weights, axis=1, keepdims=True)
+      gate_weights = jax.nn.softmax(buffer_gate, axis=1).astype(buffer_kv.dtype)
+      compressed_block = jnp.sum(buffer_kv * gate_weights, axis=1, keepdims=True)
 
     potential_update_key = compressed_block
 
