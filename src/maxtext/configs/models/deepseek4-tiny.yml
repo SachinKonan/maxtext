@@ -32,7 +32,7 @@ normalization_layer_epsilon: 1.0e-6
 decoder_block: "deepseek4"
 mhc_expansion_rate: 4
 first_num_hash_layers: 3
-indexer_head_dim: 32
+indexer_head_dim: 64
 indexer_n_heads: 2
 indexer_topk: 4
 

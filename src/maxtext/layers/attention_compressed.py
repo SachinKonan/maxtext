@@ -98,6 +98,64 @@ def csa_overlap_pooling(chunk_kv, chunk_gate, kv_norm, head_dim, prior_kv, prior
     return compressed, next_prior_kv, next_prior_gate
 
 
+def align_cache_batch(cache: Any, target_batch: int):
+  """Dynamically resizes all cache arrays to match the runtime batch dimension."""
+  if cache is None:
+    return
+
+  def align_var(cache_var, batch_axis):
+    if cache_var is None: return
+    val = cache_var.get_value()
+    if val.shape[batch_axis] != target_batch:
+      if val.shape[batch_axis] == 1:
+        # Stretch the size-1 cache to the target batch size
+        val = jnp.broadcast_to(val, val.shape[:batch_axis] + (target_batch,) + val.shape[batch_axis+1:])
+      elif val.shape[batch_axis] < target_batch:
+        # Pad if a micro-batch is smaller than the cache
+        pad_amt = target_batch - val.shape[batch_axis]
+        pad_tuple = [(0, pad_amt) if i == batch_axis else (0, 0) for i in range(val.ndim)]
+        val = jnp.pad(val, pad_tuple)
+      else:
+        # Slice if a micro-batch is smaller than the cache
+        idx = [slice(target_batch) if i == batch_axis else slice(None) for i in range(val.ndim)]
+        val = val[tuple(idx)]
+      cache_var.set_value(val)
+
+  # Standard Cache Arrays (batch axis is determined by axis order)
+  if getattr(cache, "cached_prefill_key", None) is not None:
+    align_var(cache.cached_prefill_key, cache.prefill_cache_axis_order.index(0))
+  if getattr(cache, "cached_prefill_value", None) is not None:
+    align_var(cache.cached_prefill_value, cache.prefill_cache_axis_order.index(0))
+  if getattr(cache, "cache_prefill_segment_id", None) is not None:
+    align_var(cache.cache_prefill_segment_id, 0)
+  
+  if getattr(cache, "cached_ar_key", None) is not None:
+    align_var(cache.cached_ar_key, cache.ar_cache_axis_order.index(0))
+  if getattr(cache, "cached_ar_value", None) is not None:
+    align_var(cache.cached_ar_value, cache.ar_cache_axis_order.index(0))
+  if getattr(cache, "cache_ar_segment_id", None) is not None:
+    align_var(cache.cache_ar_segment_id, 0)
+  if getattr(cache, "cached_ar_lengths", None) is not None:
+    align_var(cache.cached_ar_lengths, 0)
+
+  # DeepSeek V4 Specific Compressor Arrays (batch axis is always 0 here)
+  if getattr(cache, "leftover_buffer_kv", None) is not None:
+    align_var(cache.leftover_buffer_kv, 0)
+  if getattr(cache, "leftover_buffer_gate", None) is not None:
+    align_var(cache.leftover_buffer_gate, 0)
+  if getattr(cache, "overlap_kv", None) is not None:
+    align_var(cache.overlap_kv, 0)
+  if getattr(cache, "overlap_gate", None) is not None:
+    align_var(cache.overlap_gate, 0)
+  if getattr(cache, "entry_count", None) is not None:
+    align_var(cache.entry_count, 0)
+  if getattr(cache, "accumulator_index", None) is not None:
+    align_var(cache.accumulator_index, 0)
+
+  # Inform downstream AR logic of the newly expanded batch size
+  cache.batch = target_batch
+
+
 class BaseDeepseekCompressor(nnx.Module):
   """Shared base class for DeepSeek-V4 long-range attention compressors.
 
@@ -243,6 +301,7 @@ class DeepseekV4HCACompressor(BaseDeepseekCompressor):
                               Shape: `[batch, 1, seq_len, n_windows]`.
     """
     batch_size, seq_len, _ = hidden_states.shape
+    align_cache_batch(cache, batch_size)
     kv = self.kv_proj(hidden_states)
     gate = self.gate_proj(hidden_states)
 
@@ -251,17 +310,6 @@ class DeepseekV4HCACompressor(BaseDeepseekCompressor):
       # Expand dims to match [B, S, H, D] format for the cache
       kv_exp = jnp.expand_dims(kv, 2)
       gate_exp = jnp.expand_dims(gate, 2)
-
-      # Pad the batch dimension so [1, 1, 4, 64] -> [4, 1, 4, 64]
-      target_batch = cache.batch
-      if kv_exp.shape[0] != target_batch:
-          if kv_exp.shape[0] < target_batch:
-              pad_amt = target_batch - kv_exp.shape[0]
-              kv_exp = jnp.pad(kv_exp, ((0, pad_amt), (0, 0), (0, 0), (0, 0)))
-              gate_exp = jnp.pad(gate_exp, ((0, pad_amt), (0, 0), (0, 0), (0, 0)))
-          else:
-              kv_exp = kv_exp[:target_batch]
-              gate_exp = gate_exp[:target_batch]
       
       def hca_compressor_fn(buf_kv, buf_gate):
         gate_weights = jax.nn.softmax(buf_gate + self.position_bias.value[:, None, :], axis=1).astype(buf_kv.dtype)
@@ -494,7 +542,7 @@ class DeepseekV4Indexer(nnx.Module):
       cache: Optional[Any] = None,
   ) -> Array:
     batch_size, seq_len, _ = hidden_states.shape
-
+    align_cache_batch(cache, batch_size)
     kv = self.kv_proj(hidden_states)
     gate = self.gate_proj(hidden_states)
 
@@ -502,18 +550,6 @@ class DeepseekV4Indexer(nnx.Module):
     if model_mode == MODEL_MODE_AUTOREGRESSIVE and cache is not None:
       kv_exp = jnp.expand_dims(kv, 2)
       gate_exp = jnp.expand_dims(gate, 2)
-
-      # --- STRICT BATCH ALIGNMENT ---
-      target_batch = cache.batch
-      if kv_exp.shape[0] != target_batch:
-          if kv_exp.shape[0] < target_batch:
-              pad_amt = target_batch - kv_exp.shape[0]
-              kv_exp = jnp.pad(kv_exp, ((0, pad_amt), (0, 0), (0, 0), (0, 0)))
-              gate_exp = jnp.pad(gate_exp, ((0, pad_amt), (0, 0), (0, 0), (0, 0)))
-          else:
-              kv_exp = kv_exp[:target_batch]
-              gate_exp = gate_exp[:target_batch]
-      # ------------------------------
 
       def indexer_compressor_fn(buf_kv, buf_gate):
         chunk_kv_reshaped = jnp.swapaxes(buf_kv, 1, 2)
@@ -673,6 +709,12 @@ class DeepseekV4Indexer(nnx.Module):
     invalid = jnp.take_along_axis(future_mask, top_k_indices, axis=-1)
     
     final_indices = jnp.where(invalid, jnp.full_like(top_k_indices, -1), top_k_indices)
+
+    if model_mode == MODEL_MODE_AUTOREGRESSIVE:
+      jax.debug.print(
+        "🧭 [INDEXER] Selected blocks: {indices}",
+        indices=final_indices[0, 0, :] # Print the selected block IDs for the first batch/query
+      )
     
     return final_indices
 
@@ -744,7 +786,8 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
       indexer_cache: Optional[Any] = None,
   ) -> Tuple[Array, Array]:
     batch_size, seq_len, _ = hidden_states.shape
-
+    align_cache_batch(cache, batch_size)
+    align_cache_batch(indexer_cache, batch_size)
     # 1. ALWAYS Run Indexer (It fetches its own history inside AR)
     top_k_indices = self.indexer(
         hidden_states, q_latent, position_ids, attention_mask, model_mode, indexer_cache
@@ -757,18 +800,6 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
     if model_mode == MODEL_MODE_AUTOREGRESSIVE and cache is not None:
       kv_exp = jnp.expand_dims(kv, 2)
       gate_exp = jnp.expand_dims(gate, 2)
-
-      # --- STRICT BATCH ALIGNMENT ---
-      target_batch = cache.batch
-      if kv_exp.shape[0] != target_batch:
-          if kv_exp.shape[0] < target_batch:
-              pad_amt = target_batch - kv_exp.shape[0]
-              kv_exp = jnp.pad(kv_exp, ((0, pad_amt), (0, 0), (0, 0), (0, 0)))
-              gate_exp = jnp.pad(gate_exp, ((0, pad_amt), (0, 0), (0, 0), (0, 0)))
-          else:
-              kv_exp = kv_exp[:target_batch]
-              gate_exp = gate_exp[:target_batch]
-      # ------------------------------
 
       def csa_compressor_fn(buf_kv, buf_gate):
         chunk_kv_reshaped = jnp.swapaxes(buf_kv, 1, 2)
