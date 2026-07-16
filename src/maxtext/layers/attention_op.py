@@ -772,9 +772,13 @@ class AttentionOp(nnx.Module):
       c_len = compressed_mask.shape[-1]
       s_len = kv_seq_len - c_len
 
+      local_next_pos = next_pos
+      if model_mode == MODEL_MODE_AUTOREGRESSIVE and q_seq_len == 1:
+        local_next_pos = s_len - 1
+
       # Build causal and sliding window mask for the uncompressed sequence
       # -> [q_seq_len, s_len]
-      row_ids = jax.lax.broadcasted_iota(jnp.int32, (q_seq_len, s_len), 0) + next_pos
+      row_ids = jax.lax.broadcasted_iota(jnp.int32, (q_seq_len, s_len), 0) + local_next_pos
       # -> [1, s_len]
       col_ids = jax.lax.broadcasted_iota(jnp.int32, (1, s_len), 1)
       uncompressed_mask = col_ids <= row_ids
@@ -790,7 +794,7 @@ class AttentionOp(nnx.Module):
       if output_mask is not None:
         uncompressed_mask = uncompressed_mask & output_mask[..., :s_len]
 
-      uncompressed_mask = jnp.where(uncompressed_mask, 0.0, DEFAULT_MASK_VALUE)
+      uncompressed_mask = jnp.where(uncompressed_mask, 0.0, DEFAULT_MASK_VALUE).astype(compressed_mask.dtype)
 
       return jnp.concatenate([uncompressed_mask, compressed_mask], axis=-1)
 
