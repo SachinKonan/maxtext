@@ -695,7 +695,6 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
       config: Any,
       compress_ratio: int,
       rotary_embedding: Any,
-      indexer_rotary_embedding: Any = None,
       kernel_init: Any = nnx.initializers.normal(stddev=0.02),
       quant: Optional[Quant] = None,
       model_mode: str = MODEL_MODE_TRAIN,
@@ -728,7 +727,7 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
     self.indexer = DeepseekV4Indexer(
         config=config,
         compress_ratio=compress_ratio,
-        rotary_embedding=indexer_rotary_embedding if indexer_rotary_embedding is not None else rotary_embedding,
+        rotary_embedding=rotary_embedding,
         kernel_init=kernel_init,
         quant=quant,
         rngs=rngs,
@@ -1084,16 +1083,6 @@ class CompressedAttention(Attention):
         fprop_dtype=self.dtype,
     )
 
-    if self.compress_ratio == 4:
-      self.indexer_rotary_embedding = DeepSeekV4RotaryEmbedding(
-          head_dim=self.config.indexer_head_dim,
-          partial_rotary_factor=1.0, 
-          rope_theta=rope_theta,
-          fprop_dtype=self.dtype,
-      )
-    else:
-      self.indexer_rotary_embedding = None
-
     if self.compress_ratio > 4:
       self.hca_compressor = DeepseekV4HCACompressor(
           config=self.config,
@@ -1109,7 +1098,6 @@ class CompressedAttention(Attention):
           config=self.config,
           compress_ratio=self.compress_ratio,
           rotary_embedding=self.rotary_embedding,
-          indexer_rotary_embedding=self.indexer_rotary_embedding,
           kernel_init=self.kernel_init,
           quant=self.quant,
           model_mode=self.model_mode,
