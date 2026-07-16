@@ -1339,10 +1339,6 @@ class CompressedAttention(Attention):
           compressed_segment_mask[:, :, : compressed_mask.shape[-1]], axis=1
       )
 
-    # Extend local KV tensors with the compressed blocks
-    if compressed_kv is not None:
-      kv = jnp.concatenate([kv, compressed_kv], axis=1)
-
     kv = checkpoint_name(kv, "kv_proj")
 
     if compressed_mask is not None:
@@ -1361,6 +1357,7 @@ class CompressedAttention(Attention):
         model_mode,
         sinks=self.sinks.value if self.sinks is not None else None,
         compressed_mask=compressed_mask,
+        compressed_kv=compressed_kv,
         cached_values=current_kv_cache,
     )
 

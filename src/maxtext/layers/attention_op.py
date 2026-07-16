@@ -2133,6 +2133,7 @@ class AttentionOp(nnx.Module):
       sinks=None,
       indexer_mask: Optional[Array] = None,
       compressed_mask: Optional[Array] = None,
+      compressed_kv: Optional[Array] = None,
       slot: Optional[int] = None,
       record_max_logits: bool = False,
   ):
@@ -2142,8 +2143,10 @@ class AttentionOp(nnx.Module):
       prefill_kv_cache, ar_kv_cache = cached_values[0], cached_values[1]
     if model_mode != MODEL_MODE_TRAIN:
       assert prefill_kv_cache
-      if self.attention_type != AttentionType.COMPRESSED:
-        key, value, decoder_segment_ids = prefill_kv_cache
+      key, value, decoder_segment_ids = prefill_kv_cache
+    if compressed_kv is not None:
+      key = jnp.concatenate([key, compressed_kv], axis=1)
+      value = jnp.concatenate([value, compressed_kv], axis=1)
 
     indexer_mask_prefill = None
     indexer_mask_ar = None
@@ -2178,12 +2181,11 @@ class AttentionOp(nnx.Module):
         return prefill_unnormalized_output / prefill_exponentials_sum
       return prefill_unnormalized_output
 
-    if self.attention_type != AttentionType.COMPRESSED:
-        key, value, decoder_segment_ids, lengths = ar_kv_cache
-    else:
-        # Keep the passed-in key/value (which contain the compressed blocks), 
-        # but extract the lengths needed for ragged attention.
-        _, _, _, lengths = ar_kv_cache
+    key, value, decoder_segment_ids, lengths = ar_kv_cache
+
+    if compressed_kv is not None:
+      key = jnp.concatenate([key, compressed_kv], axis=1)
+      value = jnp.concatenate([value, compressed_kv], axis=1)
 
     ar_unnormalized_output, ar_exponentials_max, ar_exponentials_sum = self.apply_attention(
         query=query,
