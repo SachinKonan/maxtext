@@ -768,34 +768,47 @@ class AttentionOp(nnx.Module):
       output_mask = sliding_mask * output_mask
     elif self.attention_type == AttentionType.COMPRESSED:
       if compressed_mask is None:
-        raise ValueError("compressed_mask must be provided for COMPRESSED attention type")
+        # Fall back to standard sliding window for the local-only branch
+        local_next_pos_b = next_pos[:, None] if isinstance(next_pos, jax.Array) else next_pos
+        row_ids_sliding = jax.lax.broadcasted_iota(jnp.int32, (q_seq_len, 1), 0) + local_next_pos_b
+        col_ids_sliding = jax.lax.broadcasted_iota(jnp.int32, (1, kv_seq_len), 1)
+        sliding_mask = (col_ids_sliding > (row_ids_sliding - self.sliding_window_size)) & (
+            col_ids_sliding <= row_ids_sliding
+        )
+        
+        sliding_mask = jnp.expand_dims(sliding_mask, axis=-3)
+        sliding_mask = jnp.expand_dims(sliding_mask, axis=-3)
+            
+        if output_mask is not None:
+          output_mask = sliding_mask * output_mask
+        else:
+          output_mask = sliding_mask
+        return jnp.where(output_mask, 0.0, DEFAULT_MASK_VALUE)
+
+      # Handle the combined uncompressed + compressed mask:
       c_len = compressed_mask.shape[-1]
       s_len = kv_seq_len - c_len
 
       local_next_pos = next_pos
-      if model_mode == MODEL_MODE_AUTOREGRESSIVE and q_seq_len == 1:
-        local_next_pos = s_len - 1
+      local_next_pos_b = local_next_pos[:, None] if isinstance(local_next_pos, jax.Array) else local_next_pos
 
-      # Build causal and sliding window mask for the uncompressed sequence
-      # -> [q_seq_len, s_len]
-      row_ids = jax.lax.broadcasted_iota(jnp.int32, (q_seq_len, s_len), 0) + local_next_pos
-      # -> [1, s_len]
+      row_ids = jax.lax.broadcasted_iota(jnp.int32, (q_seq_len, s_len), 0) + local_next_pos_b
       col_ids = jax.lax.broadcasted_iota(jnp.int32, (1, s_len), 1)
       uncompressed_mask = col_ids <= row_ids
       if self.sliding_window_size is not None:
         uncompressed_mask = uncompressed_mask & (col_ids > (row_ids - self.sliding_window_size))
 
-      # Broadcast uncompressed_mask to match compressed_mask's layout
       target_shape = compressed_mask.shape[:-1] + (s_len,)
-      padded_shape = (1,) * (len(target_shape) - 2) + uncompressed_mask.shape
-      uncompressed_mask = jnp.broadcast_to(uncompressed_mask.reshape(padded_shape), target_shape)
+      
+      uncompressed_mask = jnp.expand_dims(uncompressed_mask, axis=-3)
+      uncompressed_mask = jnp.expand_dims(uncompressed_mask, axis=-3)
+      
+      uncompressed_mask = jnp.broadcast_to(uncompressed_mask, target_shape)
 
-      # Apply document-packing mask if it exists
       if output_mask is not None:
         uncompressed_mask = uncompressed_mask & output_mask[..., :s_len]
 
       uncompressed_mask = jnp.where(uncompressed_mask, 0.0, DEFAULT_MASK_VALUE).astype(compressed_mask.dtype)
-
       return jnp.concatenate([uncompressed_mask, compressed_mask], axis=-1)
 
     elif self.attention_type == AttentionType.CHUNK and output_mask is not None:
