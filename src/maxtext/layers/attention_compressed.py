@@ -302,10 +302,6 @@ class DeepseekV4HCACompressor(BaseDeepseekCompressor):
       
       is_valid = is_valid_prefill | is_valid_ar
       
-      # --- ANTI-NAN SAFETY ---
-      has_valid = jnp.any(is_valid, axis=-1, keepdims=True)
-      is_valid = jnp.where(has_valid, is_valid, entry_indices == 0)
-      
       compressed_mask = jnp.where(is_valid, 0.0, DEFAULT_MASK_VALUE).astype(self.dtype)
       
       return compressed_kv, compressed_mask
@@ -563,10 +559,6 @@ class DeepseekV4Indexer(nnx.Module):
       is_valid_ar = is_ar & ((entry_indices - max_prefill_comp) < jnp.expand_dims(ar_valid, axis=1))
       
       is_valid = is_valid_prefill | is_valid_ar
-      
-      # --- ANTI-NAN SAFETY ---
-      has_valid = jnp.any(is_valid, axis=-1, keepdims=True)
-      is_valid = jnp.where(has_valid, is_valid, entry_indices == 0)
       
       future_mask = ~is_valid
     
@@ -888,9 +880,6 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
 
       is_selected = jnp.any(is_valid_and_in_topk, axis=2)
       is_selected = jnp.expand_dims(is_selected, axis=1)
-
-      has_valid = jnp.any(is_selected, axis=-1, keepdims=True)
-      is_selected = jnp.where(has_valid, is_selected, jnp.arange(compressed_len)[None, None, None, :] == 0)
 
       compressed_mask = jnp.where(is_selected, 0.0, DEFAULT_MASK_VALUE).astype(self.dtype)
     else:

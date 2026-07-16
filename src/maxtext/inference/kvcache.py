@@ -758,6 +758,7 @@ class KVCache(BaseCache):
     if decoder_segment_ids is not None:
       assert cached_prefill_segment_id_var is not None
       cached_prefill_segment_id_var.set_value(decoder_segment_ids)
+
     return key, value, decoder_segment_ids
 
   def update_ar_key_value(
@@ -962,6 +963,7 @@ class KVCache(BaseCache):
         cached_ar_segment_id_var.get_value(),
         cache_ar_lengths_var.get_value(),
     )
+
     return cached_prefill, cached_ar
   
 
@@ -1083,6 +1085,7 @@ class KVCache(BaseCache):
         cached_ar_segment_id_var.get_value(),
         cache_ar_lengths_var.get_value(),
     )
+
     return cached_prefill, cached_ar
   
 
