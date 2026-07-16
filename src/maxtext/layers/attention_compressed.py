@@ -709,12 +709,6 @@ class DeepseekV4Indexer(nnx.Module):
     invalid = jnp.take_along_axis(future_mask, top_k_indices, axis=-1)
     
     final_indices = jnp.where(invalid, jnp.full_like(top_k_indices, -1), top_k_indices)
-
-    if model_mode == MODEL_MODE_AUTOREGRESSIVE:
-      jax.debug.print(
-        "🧭 [INDEXER] Selected blocks: {indices}",
-        indices=final_indices[0, 0, :] # Print the selected block IDs for the first batch/query
-      )
     
     return final_indices
 
