@@ -196,7 +196,10 @@ def _expected_and_restored_params(abstract_nnx_state, restored_linen):
   Splits the abstract by Variable type (nnx.Param) so only real weights are compared --
   rngs/dropout/batch stats live in `nnx_aux` and are restored separately.
   """
-  want = nnx.split_state(abstract_nnx_state, nnx.Param, ...)[0].to_pure_dict().get("model", {})
+  if hasattr(nnx, "LoRAParam") and nnx.state(abstract_nnx_state, nnx.LoRAParam):
+    want = nnx.split_state(abstract_nnx_state, nnx.LoRAParam, ...)[0].to_pure_dict().get("model", {})
+  else:
+    want = nnx.split_state(abstract_nnx_state, nnx.Param, ...)[0].to_pure_dict().get("model", {})
   have = restored_linen.get("params", {}).get("params", {})
   return want, have
 
@@ -211,6 +214,7 @@ def _raise_on_weight_mismatch(want, have):
   without naming the weight.
   """
   problems = _weight_mismatches(want, have)
+
   if not problems:
     return
   lines = "\n".join(f"  - '{p}': {why}" for p, why in problems)
@@ -1086,9 +1090,14 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
       step_value = state.step.get_value() if hasattr(state.step, "get_value") else state.step
       state = train_state_nnx.to_linen_checkpoint_dict({"model": state.params, "optimizer": {"step": step_value}})
     else:
-      # rngs/dropout/batch-stats are packed under items/nnx_aux so the RNG/dropout
-      # stream continues across resumes instead of resetting to a base key.
-      state = train_state_nnx.to_checkpoint_dict(state)
+      if getattr(getattr(config, "lora", None), "enable_lora", False):
+        pure_dict = state.to_pure_dict()
+        pure_dict["model"] = nnx.state(state.model, nnx.LoRAParam).to_pure_dict()
+        state = train_state_nnx.to_linen_checkpoint_dict(pure_dict)
+      else:
+        # rngs/dropout/batch-stats are packed under items/nnx_aux so the RNG/dropout
+        # stream continues across resumes instead of resetting to a base key.
+        state = train_state_nnx.to_checkpoint_dict(state)
 
   try:
     checkpoint_saved = save_checkpoint(checkpoint_manager, actual_step, state, config, data_iterator, force_ckpt_save)
