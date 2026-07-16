@@ -283,20 +283,29 @@ class DeepseekV4HCACompressor(BaseDeepseekCompressor):
       compressed_kv = jnp.expand_dims(compressed, 2) # [B, N, 1, D]
       
       # --- NEW VALIDITY MASK FOR AR MODE ---
-      # Explicitly track which indices in the padded JAX arrays contain REAL blocks
       max_prefill_comp = cached_prefill[0].shape[1]
-      prefill_valid = cache.entry_count.get_value() # [B, 1]
+      
+      # The AR valid count (how many new AR blocks have been completed)
       ar_valid = jnp.expand_dims(cached_ar[3], axis=1) # [B, 1]
+      
+      # entry_count tracks TOTAL blocks (prefill + AR). 
+      # Subtract ar_valid to get the constant, unchanging number of true prefill blocks!
+      prefill_blocks_count = cache.entry_count.get_value() - ar_valid # [B, 1]
       
       entry_indices = jnp.arange(compressed_kv.shape[1])[None, None, None, :] # [1, 1, 1, L]
       
       is_prefill = entry_indices < max_prefill_comp
-      is_valid_prefill = is_prefill & (entry_indices < jnp.expand_dims(prefill_valid, axis=(1, 3)))
+      is_valid_prefill = is_prefill & (entry_indices < jnp.expand_dims(prefill_blocks_count, axis=(1, 3)))
       
       is_ar = entry_indices >= max_prefill_comp
       is_valid_ar = is_ar & ((entry_indices - max_prefill_comp) < jnp.expand_dims(ar_valid, axis=(1, 3)))
       
       is_valid = is_valid_prefill | is_valid_ar
+      
+      # --- ANTI-NAN SAFETY ---
+      has_valid = jnp.any(is_valid, axis=-1, keepdims=True)
+      is_valid = jnp.where(has_valid, is_valid, entry_indices == 0)
+      
       compressed_mask = jnp.where(is_valid, 0.0, DEFAULT_MASK_VALUE).astype(self.dtype)
       
       return compressed_kv, compressed_mask
@@ -540,18 +549,25 @@ class DeepseekV4Indexer(nnx.Module):
       
       # --- NEW VALIDITY MASK FOR AR MODE ---
       max_prefill_comp = cached_prefill[0].shape[1]
-      prefill_valid = cache.entry_count.get_value() # [B, 1]
       ar_valid = jnp.expand_dims(cached_ar[3], axis=1) # [B, 1]
+      
+      # Calculate constant true prefill blocks
+      prefill_blocks_count = cache.entry_count.get_value() - ar_valid # [B, 1]
       
       entry_indices = jnp.arange(compressed_len)[None, None, :] # [1, 1, L]
       
       is_prefill = entry_indices < max_prefill_comp
-      is_valid_prefill = is_prefill & (entry_indices < jnp.expand_dims(prefill_valid, axis=1))
+      is_valid_prefill = is_prefill & (entry_indices < jnp.expand_dims(prefill_blocks_count, axis=1))
       
       is_ar = entry_indices >= max_prefill_comp
       is_valid_ar = is_ar & ((entry_indices - max_prefill_comp) < jnp.expand_dims(ar_valid, axis=1))
       
       is_valid = is_valid_prefill | is_valid_ar
+      
+      # --- ANTI-NAN SAFETY ---
+      has_valid = jnp.any(is_valid, axis=-1, keepdims=True)
+      is_valid = jnp.where(has_valid, is_valid, entry_indices == 0)
+      
       future_mask = ~is_valid
     
     # --- PREFILL CHUNKING & PRIMING ---
@@ -664,7 +680,9 @@ class DeepseekV4Indexer(nnx.Module):
     top_k_indices = jax.lax.top_k(index_scores, k)[1]
     invalid = jnp.take_along_axis(future_mask, top_k_indices, axis=-1)
     
-    return jnp.where(invalid, jnp.full_like(top_k_indices, -1), top_k_indices)
+    final_indices = jnp.where(invalid, jnp.full_like(top_k_indices, -1), top_k_indices)
+    
+    return final_indices
 
 
 class DeepseekV4CSACompressor(BaseDeepseekCompressor):
@@ -870,6 +888,9 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
 
       is_selected = jnp.any(is_valid_and_in_topk, axis=2)
       is_selected = jnp.expand_dims(is_selected, axis=1)
+
+      has_valid = jnp.any(is_selected, axis=-1, keepdims=True)
+      is_selected = jnp.where(has_valid, is_selected, jnp.arange(compressed_len)[None, None, None, :] == 0)
 
       compressed_mask = jnp.where(is_selected, 0.0, DEFAULT_MASK_VALUE).astype(self.dtype)
     else:
