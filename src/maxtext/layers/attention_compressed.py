@@ -98,64 +98,6 @@ def csa_overlap_pooling(chunk_kv, chunk_gate, kv_norm, head_dim, prior_kv, prior
     return compressed, next_prior_kv, next_prior_gate
 
 
-def align_cache_batch(cache: Any, target_batch: int):
-  """Dynamically resizes all cache arrays to match the runtime batch dimension."""
-  if cache is None:
-    return
-
-  def align_var(cache_var, batch_axis):
-    if cache_var is None: return
-    val = cache_var.get_value()
-    if val.shape[batch_axis] != target_batch:
-      if val.shape[batch_axis] == 1:
-        # Stretch the size-1 cache to the target batch size
-        val = jnp.broadcast_to(val, val.shape[:batch_axis] + (target_batch,) + val.shape[batch_axis+1:])
-      elif val.shape[batch_axis] < target_batch:
-        # Pad if a micro-batch is smaller than the cache
-        pad_amt = target_batch - val.shape[batch_axis]
-        pad_tuple = [(0, pad_amt) if i == batch_axis else (0, 0) for i in range(val.ndim)]
-        val = jnp.pad(val, pad_tuple)
-      else:
-        # Slice if a micro-batch is smaller than the cache
-        idx = [slice(target_batch) if i == batch_axis else slice(None) for i in range(val.ndim)]
-        val = val[tuple(idx)]
-      cache_var.set_value(val)
-
-  # Standard Cache Arrays (batch axis is determined by axis order)
-  if getattr(cache, "cached_prefill_key", None) is not None:
-    align_var(cache.cached_prefill_key, cache.prefill_cache_axis_order.index(0))
-  if getattr(cache, "cached_prefill_value", None) is not None:
-    align_var(cache.cached_prefill_value, cache.prefill_cache_axis_order.index(0))
-  if getattr(cache, "cache_prefill_segment_id", None) is not None:
-    align_var(cache.cache_prefill_segment_id, 0)
-  
-  if getattr(cache, "cached_ar_key", None) is not None:
-    align_var(cache.cached_ar_key, cache.ar_cache_axis_order.index(0))
-  if getattr(cache, "cached_ar_value", None) is not None:
-    align_var(cache.cached_ar_value, cache.ar_cache_axis_order.index(0))
-  if getattr(cache, "cache_ar_segment_id", None) is not None:
-    align_var(cache.cache_ar_segment_id, 0)
-  if getattr(cache, "cached_ar_lengths", None) is not None:
-    align_var(cache.cached_ar_lengths, 0)
-
-  # DeepSeek V4 Specific Compressor Arrays (batch axis is always 0 here)
-  if getattr(cache, "leftover_buffer_kv", None) is not None:
-    align_var(cache.leftover_buffer_kv, 0)
-  if getattr(cache, "leftover_buffer_gate", None) is not None:
-    align_var(cache.leftover_buffer_gate, 0)
-  if getattr(cache, "overlap_kv", None) is not None:
-    align_var(cache.overlap_kv, 0)
-  if getattr(cache, "overlap_gate", None) is not None:
-    align_var(cache.overlap_gate, 0)
-  if getattr(cache, "entry_count", None) is not None:
-    align_var(cache.entry_count, 0)
-  if getattr(cache, "accumulator_index", None) is not None:
-    align_var(cache.accumulator_index, 0)
-
-  # Inform downstream AR logic of the newly expanded batch size
-  cache.batch = target_batch
-
-
 class BaseDeepseekCompressor(nnx.Module):
   """Shared base class for DeepSeek-V4 long-range attention compressors.
 
@@ -301,7 +243,6 @@ class DeepseekV4HCACompressor(BaseDeepseekCompressor):
                               Shape: `[batch, 1, seq_len, n_windows]`.
     """
     batch_size, seq_len, _ = hidden_states.shape
-    align_cache_batch(cache, batch_size)
     kv = self.kv_proj(hidden_states)
     gate = self.gate_proj(hidden_states)
 
@@ -542,7 +483,6 @@ class DeepseekV4Indexer(nnx.Module):
       cache: Optional[Any] = None,
   ) -> Array:
     batch_size, seq_len, _ = hidden_states.shape
-    align_cache_batch(cache, batch_size)
     kv = self.kv_proj(hidden_states)
     gate = self.gate_proj(hidden_states)
 
@@ -780,8 +720,6 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
       indexer_cache: Optional[Any] = None,
   ) -> Tuple[Array, Array]:
     batch_size, seq_len, _ = hidden_states.shape
-    align_cache_batch(cache, batch_size)
-    align_cache_batch(indexer_cache, batch_size)
     # 1. ALWAYS Run Indexer (It fetches its own history inside AR)
     top_k_indices = self.indexer(
         hidden_states, q_latent, position_ids, attention_mask, model_mode, indexer_cache

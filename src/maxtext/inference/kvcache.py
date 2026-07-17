@@ -978,6 +978,15 @@ class KVCache(BaseCache):
     """DeepSeek-V4 aware token-by-token caching matrix (Functionally Pure for JAX tracing)."""
     if self.compress_rate == 1:
         return self.kv_cache_autoregressive(key, value, use_ragged_attention)
+    
+    incoming_batch = key.shape[0]
+    if self.leftover_buffer_kv.get_value().shape[0] != incoming_batch:
+      self.leftover_buffer_kv.set_value(jnp.repeat(self.leftover_buffer_kv.get_value(), incoming_batch, axis=0))
+      self.leftover_buffer_gate.set_value(jnp.repeat(self.leftover_buffer_gate.get_value(), incoming_batch, axis=0))
+      self.overlap_kv.set_value(jnp.repeat(self.overlap_kv.get_value(), incoming_batch, axis=0))
+      self.overlap_gate.set_value(jnp.repeat(self.overlap_gate.get_value(), incoming_batch, axis=0))
+      self.entry_count.set_value(jnp.repeat(self.entry_count.get_value(), incoming_batch, axis=0))
+      self.accumulator_index.set_value(jnp.repeat(self.accumulator_index.get_value(), incoming_batch, axis=0))
 
     # 1. Update the Accumulator Buffers
     current_index_array = self.accumulator_index.get_value()
