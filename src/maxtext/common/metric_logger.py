@@ -83,6 +83,8 @@ def record_activation_metrics(output_metrics, intermediate_outputs, config):
       output_metrics["scalar"][f"{label}/layer_{layer_num:03d}"] = per_layer[layer_num]
 
 
+
+
 class MetadataKey(enum.Enum):
   PER_DEVICE_TFLOPS = "per_device_tflops"
   PER_DEVICE_TOKENS = "per_device_tokens"
@@ -137,7 +139,7 @@ class MetricLogger:
         self._maybe_abort_after_write_metrics(metrics)
 
   def log_metrics(self, metrics, step, metric_type):
-    """Logs metrics via max_logging."""
+    """Handles console output formatting for different metric types."""
     if metric_type == "train":
       self._log_training_metrics(metrics, step)
     elif metric_type == "running_eval":
@@ -164,10 +166,12 @@ class MetricLogger:
           f"completed profiler activation/deactivation step: {step}",
       )
     else:
+      active_slices = len(elastic_utils.live_slice_indices(self.config)) if elastic_utils.elastic_enabled(self.config) else self.config.num_slices
       log_parts.extend(
           [
               f"completed step: {step}",
               f"seconds: {scalars['perf/step_time_seconds']:.3f}",
+              f"active_slices: {active_slices}",
           ]
       )
       if elastic_utils.elastic_enabled(self.config):
@@ -182,7 +186,7 @@ class MetricLogger:
     if not is_rampup and not is_metric_hidden_step:
       log_parts.extend(
           [
-              f"TFLOP/s/device: {scalars['perf/per_device_tflops_per_sec']:.3f}",
+              f"TFLOP/s/device: {scalars['perf/per_device_tflops']:.3f}",
               f"Tokens/s/device: {scalars['perf/per_device_tokens_per_sec']:.3f}",
           ]
       )
@@ -191,7 +195,7 @@ class MetricLogger:
     perplexity = scalars.get("learning/perplexity", 0.0)
     log_parts.extend(
         [
-            f"total_weights: {scalars['learning/total_weights']}",
+            f"total_weights: {scalars['learning/total_weights']:.0f}",
             f"loss: {loss:.3f}",
             f"lm_loss: {lm_loss:.3f}",
             f"perplexity: {perplexity:.3f}",
@@ -310,9 +314,17 @@ class MetricLogger:
     """Writes metrics to TensorBoard."""
     if jax.process_index() == 0:
       for metric_name in metrics.get("scalar", []):
-        self.writer.add_scalar(metric_name, np.array(metrics["scalar"][metric_name]), step)
+        val = metrics["scalar"][metric_name]
+        try:
+          val_np = np.array(val)
+          self.writer.add_scalar(metric_name, val_np, step)
+        except Exception:
+          pass
       for metric_name in metrics.get("scalars", []):
-        self.writer.add_scalars(metric_name, metrics["scalars"][metric_name], step)
+        try:
+          self.writer.add_scalars(metric_name, metrics["scalars"][metric_name], step)
+        except Exception:
+          pass
 
     if metric_type == "train":
       full_log = step % self.config.log_period == 0
@@ -390,6 +402,10 @@ class MetricLogger:
     else:
       self._pending_eval_step_count += 1
       self.buffered_metrics.append(("eval", step, metrics, step_time_delta))
+
+  def clear_metrics(self):
+    """Clears buffered metrics safely during recovery."""
+    self.buffered_metrics.clear()
 
   def _flush_one_buffered_entry(self, entry):
     """Dispatches a single buffered entry to the writer."""
