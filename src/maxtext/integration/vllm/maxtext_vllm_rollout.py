@@ -22,7 +22,7 @@ def generate_maxtext_config_for_vllm(maxtext_config):
     # We only need enough config for model architecture, not training config.
     # Converting to dict here allows it to be easily JSON serialized.
     cfg = maxtext_config
-    return {
+    payload = {
         "model_name": cfg.model_name,
         "base_num_decoder_layers": cfg.base_num_decoder_layers,
         "base_emb_dim": cfg.base_emb_dim,
@@ -30,9 +30,6 @@ def generate_maxtext_config_for_vllm(maxtext_config):
         "base_num_kv_heads": cfg.base_num_kv_heads,
         "base_mlp_dim": cfg.base_mlp_dim,
         "vocab_size": cfg.vocab_size,
-        "logits_via_embedding": getattr(cfg, "logits_via_embedding", False),
-        "use_mrope": getattr(cfg, "use_mrope", False),
-        "mrope_section_size": getattr(cfg, "mrope_section_size", None),
         "scan_layers": False,  # vLLM requires flattened layers
         "decoder_block": cfg.decoder_block,
         "emb_dim": cfg.emb_dim,
@@ -42,6 +39,15 @@ def generate_maxtext_config_for_vllm(maxtext_config):
         "num_decoder_layers": cfg.num_decoder_layers,
         "attention": cfg.attention,
     }
+
+    # Only inject optional fields if they actually exist on the source config
+    # to prevent PyConfig strict validation errors upon reconstruction.
+    optional_fields = ["logits_via_embedding", "use_mrope", "mrope_section_size"]
+    for field in optional_fields:
+        if hasattr(cfg, field):
+            payload[field] = getattr(cfg, field)
+
+    return payload
 
 
 def unroll_gemma_scanned_weights(weights):
