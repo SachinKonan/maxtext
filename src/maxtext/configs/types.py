@@ -1979,6 +1979,15 @@ class ElasticTraining(BaseModel):
   """
 
   elastic_enabled: bool = Field(False, description="Whether to enable elastic training.")
+  elastic_backup_kind: str = Field(
+      "snapshot",
+      description=("The kind of backup to use for elastic training: 'checkpoint' or" " 'snapshot'."),
+  )
+  elastic_snapshot_interval: int = Field(10, description="The interval in steps to save snapshots to host memory.")
+  elastic_new_slice_check_period: int = Field(
+      10,
+      description=("The interval in seconds to poll for newly joined active slices."),
+  )
   elastic_timeout_seconds: int = Field(
       300,
       description=(
@@ -3163,6 +3172,10 @@ class MaxTextConfig(
       )
     if self.elastic_enabled and not self.enable_single_controller:
       raise ValueError("Elastic training is only supported with Pathways (`enable_single_controller=True`).")
+    if self.elastic_backup_kind not in ("snapshot", "checkpoint"):
+      raise ValueError(
+          "elastic_backup_kind must be one of 'snapshot' or 'checkpoint', got" f" '{self.elastic_backup_kind}'."
+      )
     if self.colocated_python_data_input and not self.enable_single_controller:
       raise ValueError(
           "Colocated python data input is only supported with Pathways (single"

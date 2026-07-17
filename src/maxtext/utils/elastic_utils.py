@@ -14,8 +14,9 @@
 
 """Utility functions for Elastic Training."""
 
-import functools
 from collections import Counter
+import contextlib
+import functools
 from types import SimpleNamespace
 
 import jax
@@ -62,6 +63,71 @@ def record_elastic_reinit_end() -> None:
 def elastic_enabled(config) -> bool:
   """Returns whether elastic mode is enabled."""
   return pathwaysutils.is_pathways_backend_used() and config.elastic_enabled
+
+
+def elastic_snapshot(config) -> bool:
+  """Returns whether elastic snapshot mode is enabled."""
+  return elastic_enabled(config) and config.elastic_backup_kind == "snapshot"
+
+
+def maybe_bubble_elastic_exception(config, e: Exception) -> None:
+  """Checks JAX/ScaleUp elastic errors and re-raises them to recover.
+
+  Concept:
+    This helper safeguards execution blocks (like data loading or checkpointing)
+    inside elastic environments. In elastic training, if a TPU slice drops
+    (raising `JaxRuntimeError`) or scales up (raising `ScaleUpSignalError`),
+    these exceptions must bubble up to the main recovery loop in `train.py`
+    so they can trigger host reinitialization and mesh recovery.
+
+    However, normal code execution failures (such as local stopped iterators
+    or disk I/O errors) should not bubble, and are handled/wrapped locally
+    instead (e.g. into `StopTraining`).
+
+  Args:
+    config: Maxtext configuration object.
+    e: The exception currently being evaluated.
+  """
+  if elastic_enabled(config) and isinstance(e, (jax.errors.JaxRuntimeError, manager.ScaleUpSignalError)):
+    raise e
+
+
+@contextlib.contextmanager
+def elastic_checkpoint_guard(config, checkpoint_manager, handler_fn=None):
+  """Context manager that wraps elastic checkpointing save logic.
+
+  Concept:
+    This context manager binds the pre-save preemption/failure checks and the
+    post-save scale-up check inside a single cohesive block.
+
+  Execution Flow:
+    1. The context manager enters.
+    2. The wrapped save block is executed (via `yield`).
+    3. If save fails with an exception `e`, it calls
+       `maybe_bubble_elastic_exception` to bubble JAX/ScaleUp errors, or
+       delegates to `handler_fn`.
+    4. If save completes successfully, the context resumes and calls
+       `maybe_elastic_scale_up()`. This checks if a new TPU slice has joined,
+       blocks until the async save completes, and then raises new
+       `ScaleUpSignalError` to interrupt and scale-up the topology.
+
+  Args:
+    config: Maxtext configuration object.
+    checkpoint_manager: The CheckpointManager instance.
+    handler_fn: Optional callback function(Exception) that handles/wraps
+      non-elastic exceptions. If this handler raises a new exception, that new
+      exception is propagated. If it returns normally (returns None) or is not
+      provided, the original exception is re-raised (preserving its traceback).
+  """
+  try:
+    yield
+    maybe_elastic_scale_up(config, checkpoint_manager)
+  except Exception as e:  # pylint: disable=broad-except
+    maybe_bubble_elastic_exception(config, e)
+    if handler_fn:
+      handler_fn(e)
+    else:
+      raise
 
 
 def should_use_elastic(config) -> bool:
@@ -218,6 +284,9 @@ def is_scale_up_event(config) -> bool:
 
 def maybe_elastic_scale_up(config, checkpoint_manager):
   """Waits for a checkpoint to finish before interrupting for scale up."""
+  if not should_use_elastic(config):
+    max_logging.log("maybe_elastic_scale_up: Elastic training is not enabled.")
+    return
   if is_scale_up_event(config):
     max_logging.log(
         "Started a checkpoint and a new slice is available. Waiting for current"

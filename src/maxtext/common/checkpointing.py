@@ -1041,7 +1041,7 @@ def _handle_post_checkpoint_preemption(checkpoint_manager, step, force_ckpt_save
   if force_ckpt_save or reached_preemption:
     checkpoint_manager.wait_until_finished()
   if reached_preemption:
-    raise exceptions.StopTraining("Job is preempted.")
+    raise exceptions.StopTraining("Job received termination signal (SIGTERM).")
 
 
 def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step=None):
@@ -1090,26 +1090,21 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
       # stream continues across resumes instead of resetting to a base key.
       state = train_state_nnx.to_checkpoint_dict(state)
 
-  try:
-    checkpoint_saved = save_checkpoint(checkpoint_manager, actual_step, state, config, data_iterator, force_ckpt_save)
-    if checkpoint_saved:
-      print_save_message(actual_step, config.async_checkpointing)
-    if config.elastic_enabled:
-      elastic_utils.maybe_elastic_scale_up(config, checkpoint_manager)
-  except elastic_utils.manager.ScaleUpSignalError as e:
-    if config.elastic_enabled:
-      max_logging.log(f"Elastic event detected, letting exception bubble up: {e}")
-      raise
-    else:
-      raise exceptions.StopTraining("Job is preempted.") from e
-  except jax.errors.JaxRuntimeError as e:
-    if config.elastic_enabled:
-      max_logging.log(f"Elastic event detected, letting exception bubble up: {e}")
-      raise
-    else:
-      raise exceptions.StopTraining("Job is preempted.") from e
-  except Exception as e:
-    raise exceptions.StopTraining(f"Checkpointing failed. {str(e)}") from e
+  def _checkpoint_error_handler(err):
+    """Handles checkpointing errors, when not in an elastic context."""
+    raise exceptions.StopTraining(f"Checkpointing failed. {str(err)}") from err
+
+  with elastic_utils.elastic_checkpoint_guard(config, checkpoint_manager, _checkpoint_error_handler):
+    checkpoint_saved = save_checkpoint(
+        checkpoint_manager,
+        actual_step,
+        state,
+        config,
+        data_iterator,
+        force_ckpt_save,
+    )
+  if checkpoint_saved:
+    print_save_message(actual_step, config.async_checkpointing)
 
   # Wait for any pending checkpoint save to finish during preemption or final
   # step save, then raise upon preemption.
