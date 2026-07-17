@@ -447,6 +447,79 @@ class ElasticUtilsTest(unittest.TestCase):
     elastic_utils.ensure_elastic_manager_initialized(config)
     self.assertEqual(elastic_utils.elastic_manager, self.fake_manager)
 
+  def test_is_scale_up_event_with_set(self):
+    config = FakeConfig()
+    config.elastic_enabled = True
+    elastic_utils.elastic_manager = self.fake_manager
+
+    # Scenario 1: available_inactive_slices is present and not empty
+    self.fake_manager.available_inactive_slices = {1, 2}
+    self.assertTrue(elastic_utils.is_scale_up_event(config))
+
+    # Scenario 2: available_inactive_slices is present and empty
+    self.fake_manager.available_inactive_slices = set()
+    self.assertFalse(elastic_utils.is_scale_up_event(config))
+
+    # Scenario 3: available_inactive_slices is missing (fallback to event)
+    if hasattr(self.fake_manager, "available_inactive_slices"):
+      delattr(self.fake_manager, "available_inactive_slices")
+    self.fake_manager.new_slice_event.is_set.return_value = True
+    self.assertTrue(elastic_utils.is_scale_up_event(config))
+
+    self.fake_manager.new_slice_event.is_set.return_value = False
+    self.assertFalse(elastic_utils.is_scale_up_event(config))
+
+  def test_maybe_snapshot_state_nnx(self):
+    """Tests maybe_snapshot_state with TrainStateNNX."""
+    from flax import nnx
+    from maxtext.common.train_state_nnx import TrainStateNNX
+
+    class DummyModel(nnx.Module):
+      def __init__(self, rngs):
+        self.linear = nnx.Linear(2, 2, rngs=rngs)
+
+    model = DummyModel(rngs=nnx.Rngs(0))
+    tx = nnx.optimizer.adam(0.01)
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+    state = TrainStateNNX(model, optimizer)
+
+    elastic_mgr = Mock()
+    elastic_utils.maybe_snapshot_state(elastic_mgr, step=10, state=state, force=True, block=True)
+
+    elastic_mgr.maybe_snapshot.assert_called_once()
+    _, kwargs = elastic_mgr.maybe_snapshot.call_args
+    self.assertEqual(kwargs["step"], 10)
+    self.assertIn("model", kwargs["snapshot_jax_arrays"])
+    self.assertIn("optimizer", kwargs["snapshot_jax_arrays"])
+
+  def test_restore_resharded_state_nnx(self):
+    """Tests restore_resharded_state with TrainStateNNX."""
+    from flax import nnx
+    from maxtext.common.train_state_nnx import TrainStateNNX
+
+    class DummyModel(nnx.Module):
+      def __init__(self, rngs):
+        self.linear = nnx.Linear(2, 2, rngs=rngs)
+
+    model = DummyModel(rngs=nnx.Rngs(0))
+    tx = nnx.optimizer.adam(0.01)
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+    state = TrainStateNNX(model, optimizer)
+
+    snapshot_jax_arrays = {
+        "model": nnx.to_pure_dict(nnx.state(model)),
+        "optimizer": nnx.to_pure_dict(nnx.state(optimizer)),
+    }
+
+    elastic_mgr = Mock()
+    elastic_mgr.get_resharded_snapshot.return_value = (15, snapshot_jax_arrays, None)
+
+    restored_step, restored_state = elastic_utils.restore_resharded_state(elastic_mgr, mesh=None, state=state)
+
+    self.assertEqual(restored_step, 15)
+    self.assertEqual(int(restored_state.optimizer.step.value), 15)
+
 
 if __name__ == "__main__":
   unittest.main()
+
