@@ -341,10 +341,15 @@ class DeepseekV4HCACompressor(BaseDeepseekCompressor):
         if update_blocks.shape[3] < operand_shape[3]:
             pad_amt = operand_shape[3] - update_blocks.shape[3]
             update_blocks = jnp.pad(update_blocks, ((0, 0), (0, 0), (0, 0), (0, pad_amt)))
+
+        operand = cache_key_var.get_value()
+        batch_axis = cache.prefill_cache_axis_order.index(0)
+        if operand.shape[batch_axis] != update_blocks.shape[batch_axis]:
+          operand = jnp.repeat(operand, update_blocks.shape[batch_axis], axis=batch_axis)
         
         # Insert along the sequence axis (which is axis=0 in the transposed shape)
         cache_key_var.set_value(
-            jax.lax.dynamic_update_slice_in_dim(cache_key_var.get_value(), update_blocks, 0, axis=0)
+            jax.lax.dynamic_update_slice_in_dim(operand, update_blocks, 0, axis=0)
         )
         cache.entry_count.set_value(jnp.full((batch_size, 1), compressed_len, dtype=jnp.int32))
 
@@ -602,8 +607,14 @@ class DeepseekV4Indexer(nnx.Module):
           update_blocks = update_blocks[:, :operand_shape[1], ...]
           
           # 4. Insert along the Sequence axis (which is now axis=0)
+          operand = cache_key_var.get_value()
+          batch_axis = cache.prefill_cache_axis_order.index(0)
+          if operand.shape[batch_axis] != update_blocks.shape[batch_axis]:
+            operand = jnp.repeat(operand, update_blocks.shape[batch_axis], axis=batch_axis)
+
+          # 4. Insert along the Sequence axis (which is now axis=0)
           cache_key_var.set_value(
-              jax.lax.dynamic_update_slice_in_dim(cache_key_var.get_value(), update_blocks, 0, axis=0)
+              jax.lax.dynamic_update_slice_in_dim(operand, update_blocks, 0, axis=0)
           )
           cache.entry_count.set_value(jnp.full((batch_size, 1), compressed_len, dtype=jnp.int32))
           
@@ -821,8 +832,14 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
               update_blocks = jnp.pad(update_blocks, ((0, 0), (0, 0), (0, 0), (0, pad_amt)))
           
           # Insert along the sequence axis (which is axis=0 in the transposed shape)
+          operand = cache_key_var.get_value()
+          batch_axis = cache.prefill_cache_axis_order.index(0)
+          if operand.shape[batch_axis] != update_blocks.shape[batch_axis]:
+            operand = jnp.repeat(operand, update_blocks.shape[batch_axis], axis=batch_axis)
+
+          # Insert along the sequence axis (which is axis=0 in the transposed shape)
           cache_key_var.set_value(
-              jax.lax.dynamic_update_slice_in_dim(cache_key_var.get_value(), update_blocks, 0, axis=0)
+              jax.lax.dynamic_update_slice_in_dim(operand, update_blocks, 0, axis=0)
           )
           cache.entry_count.set_value(jnp.full((batch_size, 1), compressed_len, dtype=jnp.int32))
 
