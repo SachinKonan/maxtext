@@ -977,16 +977,29 @@ class KVCache(BaseCache):
   ):
     """DeepSeek-V4 aware token-by-token caching matrix (Functionally Pure for JAX tracing)."""
     if self.compress_rate == 1:
-        return self.kv_cache_autoregressive(key, value, use_ragged_attention)
+      return self.kv_cache_autoregressive(key, value, use_ragged_attention)
     
     incoming_batch = key.shape[0]
-    if self.leftover_buffer_kv.get_value().shape[0] != incoming_batch:
-      self.leftover_buffer_kv.set_value(jnp.repeat(self.leftover_buffer_kv.get_value(), incoming_batch, axis=0))
-      self.leftover_buffer_gate.set_value(jnp.repeat(self.leftover_buffer_gate.get_value(), incoming_batch, axis=0))
-      self.overlap_kv.set_value(jnp.repeat(self.overlap_kv.get_value(), incoming_batch, axis=0))
-      self.overlap_gate.set_value(jnp.repeat(self.overlap_gate.get_value(), incoming_batch, axis=0))
-      self.entry_count.set_value(jnp.repeat(self.entry_count.get_value(), incoming_batch, axis=0))
-      self.accumulator_index.set_value(jnp.repeat(self.accumulator_index.get_value(), incoming_batch, axis=0))
+    
+    # Safely stretch or slice the custom V4 arrays to match the runtime batch
+    def align_var(cache_var):
+      val = cache_var.get_value()
+      if val.shape[0] != incoming_batch:
+        if val.shape[0] == 1:
+          val = jnp.repeat(val, incoming_batch, axis=0)
+        elif val.shape[0] < incoming_batch:
+          pad_amt = incoming_batch - val.shape[0]
+          val = jnp.pad(val, ((0, pad_amt),) + ((0, 0),) * (val.ndim - 1))
+        else:
+          val = val[:incoming_batch]
+        cache_var.set_value(val)
+
+    align_var(self.leftover_buffer_kv)
+    align_var(self.leftover_buffer_gate)
+    align_var(self.overlap_kv)
+    align_var(self.overlap_gate)
+    align_var(self.entry_count)
+    align_var(self.accumulator_index)
 
     # 1. Update the Accumulator Buffers
     current_index_array = self.accumulator_index.get_value()
@@ -1009,7 +1022,7 @@ class KVCache(BaseCache):
     if compressor_fn is not None:
       compressed_block, next_overlap_kv, next_overlap_gate = compressor_fn(buffer_kv, buffer_gate)
       
-      # Conditionally update the overlap registers only if the window finished (and if the layer uses them!)
+      # Conditionally update the overlap registers only if the window finished
       if next_overlap_kv is not None:
         new_overlap_kv = jnp.where(window_complete, next_overlap_kv, self.overlap_kv.get_value())
         self.overlap_kv.set_value(new_overlap_kv)
@@ -1049,8 +1062,8 @@ class KVCache(BaseCache):
         ar_index, cache_ar_lengths_var.get_value(), use_ragged_attention
     )
 
-    # 5. Conditionally write the segment ID mask
-    active_indicator = jnp.zeros((self.batch, 1), dtype=jnp.int32) + DECODING_ACTIVE_SEQUENCE_INDICATOR
+    # 5. Conditionally write the segment ID mask (FIXED: Uses incoming_batch)
+    active_indicator = jnp.zeros((incoming_batch, 1), dtype=jnp.int32) + DECODING_ACTIVE_SEQUENCE_INDICATOR
     zero_indicator = jnp.zeros_like(active_indicator)
     indicator_to_write = jnp.where(window_complete, active_indicator, zero_indicator)
 
