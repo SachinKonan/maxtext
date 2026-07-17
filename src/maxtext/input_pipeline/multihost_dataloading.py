@@ -12,159 +12,87 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pylint: disable=unused-import
-"""SPMD Multihost Dataloading Utilities.
+"""Multihost dataloading utilities."""
 
-Adapted from Sholto's:
-https://github.com/sholtodouglas/multihost_dataloading
-"""
+from collections.abc import Iterable, Sequence
 from functools import partial
-from typing import Union, Sequence
-from collections.abc import Iterator, Iterable
-import time
 import json
-
 from etils import epath
-
-try:
-  import tensorflow as tf
-
-  _TF_RETRYABLE_ERRORS = (tf.errors.FailedPreconditionError,)
-except ImportError:
-  tf = None  # type: ignore[assignment]
-  _TF_RETRYABLE_ERRORS = ()
-
 import numpy as np
 
 import jax
-import jax.tree_util as jtu
-from jax.sharding import PartitionSpec
-from jax.sharding import NamedSharding
-from jax.sharding import Mesh
 from jax.experimental import colocated_python
 import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+import jax.tree_util as jtu
 
 from maxtext.utils import max_logging
 
 
-def _build_global_shape_and_sharding(
-    local_shape: tuple[int, ...], global_mesh: Mesh
-) -> tuple[tuple[int, ...], NamedSharding]:
-  sharding = NamedSharding(global_mesh, PartitionSpec(global_mesh.axis_names))
-
-  global_shape = (jax.process_count() * local_shape[0],) + local_shape[1:]
-
-  return global_shape, sharding
-
-
-def _form_global_array(path, array: np.ndarray, global_mesh: Mesh) -> jax.Array:
-  """Put local sharded array into local devices"""
-  global_shape, sharding = _build_global_shape_and_sharding(np.shape(array), global_mesh)
-
-  try:
-    local_device_arrays = np.split(array, len(global_mesh.local_devices), axis=0)
-  except ValueError as array_split_error:
-    raise ValueError(
-        f"Unable to put to devices shape {array.shape} with "
-        f"local device count {len(global_mesh.local_devices)} "
-        f"at {jtu.keystr(path)}"
-    ) from array_split_error
-
-  local_device_buffers = jax.device_put(local_device_arrays, global_mesh.local_devices)
-  return jax.make_array_from_single_device_arrays(global_shape, sharding, local_device_buffers)
-
-
 class MultiHostDataLoadIterator:
-  """fold get_next_batch_sharded into a iterator class.
-  expansion_factor_for_grain is only used for grain pipeline when having a subset of hosts loading real data.
-  """
+  """Wrapper for MultiHostDataLoadIterator that handles device placement."""
 
-  def __init__(
-      self,
-      dataloader: Iterable,
-      global_mesh: Mesh,
-      generate_padding_batch: bool = False,
-      expansion_loading_factor_for_grain: int = -1,
-  ):
-    self.global_mesh = global_mesh
+  def __init__(self, dataloader, global_mesh, generate_padding_batch_eval=False):
     self.dataloader = dataloader
-    if hasattr(self.dataloader, "as_numpy_iterator"):
-      self.local_iterator = self.dataloader.as_numpy_iterator()
-    elif isinstance(self.dataloader, Iterable):
-      self.local_iterator = iter(self.dataloader)
+    self.global_mesh = global_mesh
+    self.generate_padding_batch_eval = generate_padding_batch_eval
+
+    if hasattr(dataloader, "as_numpy_iterator"):
+      self.iterator = dataloader.as_numpy_iterator()
+    elif isinstance(dataloader, Iterable):
+      self.iterator = iter(dataloader)
     else:
-      raise ValueError("Type error: dataloader should be either tf.data.Dataset or Iterable.")
-    self.out_of_data = False
-    self.last_local_data = None
-    self.generate_padding_batch = generate_padding_batch
-    self.expansion_loading_factor_for_grain = expansion_loading_factor_for_grain
+      raise ValueError("Type error: dataloader should be Iterable.")
 
   def reset(self):
-    if hasattr(self.dataloader, "as_numpy_iterator"):
-      self.local_iterator = self.dataloader.as_numpy_iterator()
-    elif isinstance(self.dataloader, Iterable):
-      self.local_iterator = iter(self.dataloader)
-    else:
-      raise ValueError("Type error: dataloader should be either tf.data.Dataset or Iterable.")
-    self.out_of_data = False
-    self.last_local_data = None
+    self.iterator.reset()  # pyrefly: ignore[missing-attribute]
 
   def __iter__(self):
-    self.reset()
     return self
 
   def __next__(self):
-    return self._get_next_batch_sharded()
-
-  def _get_next_batch_sharded(self) -> jax.Array:
-    """Splits the host loaded data equally over all devices."""
-    if self.out_of_data and self.generate_padding_batch:
-      local_data = self._make_padding_batch()
-
-    else:
-      SLEEP_TIME = 10
-      MAX_DATA_LOAD_ATTEMPTS = 30
-
-      local_data = None
-      for _ in range(MAX_DATA_LOAD_ATTEMPTS):
-        try:
-          local_data = next(self.local_iterator)
-          if self.expansion_loading_factor_for_grain > 1:
-            # Since grain checkpoint requires fixed batch_size, we run the dataIterator for
-            # expansion_loading_factor_for_grain times to get the
-            # right batch_size for the host that is loading real data.
-            local_data_list = [local_data]
-            for _ in range(1, int(self.expansion_loading_factor_for_grain)):
-              next_batch = next(self.local_iterator)
-              local_data_list.append(next_batch)
-            local_data = jtu.tree_map(lambda *xs: np.concatenate(xs, axis=0), *local_data_list)
-          break  # exit the loop on success
-        except _TF_RETRYABLE_ERRORS as e:
-          max_logging.log(f"Failed to get next data batch due to {e}, retrying")
-          time.sleep(SLEEP_TIME)
-        except StopIteration as e:
-          if self.generate_padding_batch:
-            max_logging.log(
-                f"MultiHostDataLoadIterator: host {jax.process_index()} failed to load data with {type(e)} error: ({e}). "
-                "It may have reached the end of the data. Generating a padding batch as generate_padding_batch=True."
-            )
-            self.out_of_data = True
-            local_data = self._make_padding_batch()
-            break
-          else:
-            raise e
+    try:
+      local_data = next(self.iterator)
+    except StopIteration:
+      if self.generate_padding_batch_eval:
+        local_data = self.dataloader.get_padding_batch()
       else:
-        raise TimeoutError(f"Failed to load data after {MAX_DATA_LOAD_ATTEMPTS} retry attempts.")
+        raise StopIteration  # pylint: disable=raise-missing-from
 
-      self.last_local_data = local_data
-    input_gdas = jtu.tree_map_with_path(partial(_form_global_array, global_mesh=self.global_mesh), local_data)
+    def form_global_array(path, array, mesh):
+      # We need to construct local device arrays for jax.make_array_from_single_device_arrays
+      # by spliting the host array along the first axis.
+      # When local_device_count is 1, local_data is directly the single device array.
+      # When local_device_count > 1, local_data is a host array that needs to be split.
+      if len(mesh.local_devices) == 1:
+        device_arrays = [array]
+      else:
+        try:
+          device_arrays = np.split(array, len(mesh.local_devices), axis=0)
+        except ValueError as array_split_error:
+          raise ValueError(
+              f"Unable to put to devices shape {array.shape} with "
+              f"local device count {len(mesh.local_devices)} "
+              f"at {jtu.keystr(path)}"
+          ) from array_split_error
+      device_arrays = jax.device_put(device_arrays, mesh.local_devices)
+      global_shape = (array.shape[0] * jax.process_count(), *array.shape[1:])
+      return jax.make_array_from_single_device_arrays(
+          shape=global_shape,
+          sharding=NamedSharding(mesh, PartitionSpec(mesh.axis_names)),
+          arrays=device_arrays,
+      )
 
-    return input_gdas
+    return jtu.tree_map_with_path(
+        partial(form_global_array, mesh=self.global_mesh),
+        local_data,
+    )
 
-  def _make_padding_batch(self):
-    if self.last_local_data is None:
-      raise ValueError("last_local_data is None, cannot make padding batch.")
-    return jtu.tree_map(lambda x: jnp.full_like(x, 0), self.last_local_data)
+  def save_state(self, step):
+    self.iterator.save(step)  # pyrefly: ignore[missing-attribute]
+
+  def restore_state(self, step):
+    self.iterator.restore(step)  # pyrefly: ignore[missing-attribute]
 
 
 def _colocated_cpu_devices(
@@ -232,10 +160,6 @@ class RemoteIterator:
     step = step_array.addressable_data(0).item()
     directory = epath.Path(self.checkpoint_path) / str(step) / "iter"
     if self.elastic:
-      # ElasticIterator state is a single global scalar shared by all shards,
-      # so we write one fixed file (from process 0 only) and every process
-      # reads the same file on restore — this survives elastic resizes that
-      # change `jax.process_count()`.
       if jax.process_index() == 0:
         directory.mkdir(parents=True, exist_ok=True)
         filename = directory / "process_0.json"
@@ -254,6 +178,8 @@ class RemoteIterator:
       filename = directory / "process_0.json"
     else:
       filename = directory / f"process_{jax.process_index()}-of-{jax.process_count()}.json"
+    if not filename.exists():
+      raise FileNotFoundError(f"State file not found: {filename}")
     state = json.loads(filename.read_text())
     self.iterator.set_state(state)  # pyrefly: ignore[missing-attribute]
     return step_array
@@ -262,13 +188,27 @@ class RemoteIterator:
 class RemoteIteratorWrapper:
   """Wrapper for RemoteIterator that handles device placement."""
 
-  def __init__(self, get_ds_fn, preprocessing_fn, global_mesh, global_shape, checkpoint_path="", elastic=False):
+  def __init__(
+      self,
+      get_ds_fn,
+      preprocessing_fn,
+      global_mesh,
+      global_shape,
+      sharding_spec=None,
+      checkpoint_path="",
+      elastic=False,
+  ):
     self.cpu_devices = _colocated_cpu_devices(tuple(global_mesh.devices.flat))
     self.cpu_mesh = _colocated_cpu_mesh(global_mesh)
-    self.tpu_sharding = jax.sharding.NamedSharding(global_mesh, PartitionSpec(global_mesh.axis_names))
-    self.cpu_sharding = jax.sharding.NamedSharding(self.cpu_mesh, PartitionSpec(self.cpu_mesh.axis_names))
-    self.dummy_array = jnp.zeros((len(self.cpu_devices)))
+    if sharding_spec is None:
+      sharding_spec = PartitionSpec(global_mesh.axis_names)
+    array_shape = global_shape if global_shape is not None else (len(self.cpu_devices),)
+
+    self.tpu_sharding = jax.sharding.NamedSharding(global_mesh, sharding_spec)
+    self.cpu_sharding = jax.sharding.NamedSharding(self.cpu_mesh, sharding_spec)
+    self.dummy_array = jnp.zeros(array_shape, dtype=jnp.int32)
     self.dummy_array = jax.device_put(self.dummy_array, self.cpu_sharding)
+
     # This is a proxy to a RemoteIterator running in a colocated process,
     # named "local_iterator" to match MultiHostDataLoadIterator's interface.
     remote_iterator_cls = colocated_python.colocated_python_class(RemoteIterator)
@@ -289,7 +229,6 @@ class RemoteIteratorWrapper:
 
   def __next__(self):
     out = self.local_iterator.get_next(self.dummy_array)  # pyrefly: ignore[missing-attribute]
-    # use tree_map is out is a dict
     return jax.device_put(out, self.tpu_sharding)
 
   def save_state(self, step):

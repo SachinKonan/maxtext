@@ -28,6 +28,7 @@ from maxtext.input_pipeline import multihost_dataloading
 from maxtext.input_pipeline.packing import sequence_packing
 from maxtext.input_pipeline import input_pipeline_utils
 from maxtext.utils import max_logging
+from maxtext.utils import sharding as max_sharding
 
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 
@@ -247,6 +248,18 @@ def make_tfds_train_iterator(
         max_target_length=config.max_target_length,
         data_column_names=config.train_data_columns,
         shuffle=config.enable_data_shuffling,
+    get_ds_fn = functools.partial(
+        get_datasets,
+        **get_datasets_kwargs,
+    )
+    preprocessing_fn = functools.partial(
+        preprocessing_pipeline,
+        tokenizer_path=config.tokenizer_path,
+        tokenizer_type=config.tokenizer_type,
+        global_batch_size=config.global_batch_size_to_load,
+        max_target_length=config.max_target_length,
+        data_column_names=config.train_data_columns,
+        shuffle=config.enable_data_shuffling,
         data_shuffle_seed=config.data_shuffle_seed,
         tokenize=config.tokenize_train_data,
         add_bos=config.add_bos,
@@ -255,9 +268,11 @@ def make_tfds_train_iterator(
         pack_examples=config.packing,
         hf_access_token=config.hf_access_token,
     )
+    data_sharding = max_sharding.get_input_data_sharding(config, global_mesh)
+    sharding_spec = data_sharding.spec
     global_shape = (config.global_batch_size_to_load, config.max_target_length)
     return multihost_dataloading.RemoteIteratorWrapper(
-        get_ds_fn, preprocessing_fn, global_mesh, global_shape, checkpoint_path=config.checkpoint_dir
+        get_ds_fn, preprocessing_fn, global_mesh, global_shape, sharding_spec=sharding_spec, checkpoint_path=config.checkpoint_dir, elastic=config.elastic_enabled
     )
 
 
@@ -322,7 +337,10 @@ def make_tfds_eval_iterator(
         pack_examples=config.packing,
         hf_access_token=config.hf_access_token,
     )
+    from maxtext.utils import sharding as max_sharding
+    data_sharding = max_sharding.get_input_data_sharding(config, global_mesh)
+    sharding_spec = data_sharding.spec
     global_shape = (config.global_batch_size_to_load_eval, config.max_target_length)
     return multihost_dataloading.RemoteIteratorWrapper(
-        get_ds_fn, preprocessing_fn, global_mesh, global_shape, checkpoint_path=config.checkpoint_dir
+        get_ds_fn, preprocessing_fn, global_mesh, global_shape, sharding_spec=sharding_spec, checkpoint_path=config.checkpoint_dir
     )
