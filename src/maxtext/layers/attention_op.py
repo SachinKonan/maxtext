@@ -767,16 +767,35 @@ class AttentionOp(nnx.Module):
         sliding_mask = sliding_mask[:, None, None, :, :]
       output_mask = sliding_mask * output_mask
     elif self.attention_type == AttentionType.COMPRESSED:
+      # MaxText evaluates the Prefill and AR caches separately.
+      # We must dynamically find the query's true physical position inside the specific cache array.
+      def get_ar_row_ids(cache_len):
+          if model_mode == MODEL_MODE_AUTOREGRESSIVE and q_seq_len == 1:
+              if decoder_segment_ids is not None:
+                  # decoder_segment_ids holds valid tokens. The true position is the max valid index.
+                  is_valid = decoder_segment_ids[:, :cache_len] == DECODING_ACTIVE_SEQUENCE_INDICATOR
+                  valid_indices = jnp.where(is_valid, jnp.arange(cache_len)[None, :], -1)
+                  max_valid = jnp.max(valid_indices, axis=-1, keepdims=True) # [batch, 1]
+                  return max_valid[:, None, :] # [batch, 1, 1]
+              return cache_len - 1
+          else:
+              local_next = next_pos[:, None] if isinstance(next_pos, jax.Array) else next_pos
+              return jax.lax.broadcasted_iota(jnp.int32, (q_seq_len, cache_len), 0) + local_next
+
       if compressed_mask is None:
-        # Fall back to standard sliding window (Native MaxText idiom)
-        row_ids_sliding = jax.lax.broadcasted_iota(jnp.int32, (q_seq_len, 1), 0) + next_pos
+        # Fall back to standard sliding window
+        row_ids_sliding = get_ar_row_ids(kv_seq_len)
         col_ids_sliding = jax.lax.broadcasted_iota(jnp.int32, (1, kv_seq_len), 1)
+        
         sliding_mask = (col_ids_sliding > (row_ids_sliding - self.sliding_window_size)) & (
             col_ids_sliding <= row_ids_sliding
         )
         
-        # Native 5D cast: (1, 1, 1, Q, K)
-        sliding_mask_5d = sliding_mask[None, None, None, :, :]
+        # Native 5D cast: Handles both [batch, 1, cache] and [1, cache] shapes
+        if sliding_mask.ndim == 3:
+            sliding_mask_5d = sliding_mask[:, None, None, :, :]
+        else:
+            sliding_mask_5d = sliding_mask[None, None, None, :, :]
         
         if output_mask is not None:
           output_mask = sliding_mask_5d * output_mask
@@ -788,20 +807,17 @@ class AttentionOp(nnx.Module):
       c_len = compressed_mask.shape[-1]
       s_len = kv_seq_len - c_len
 
-      # Use MaxText's native scalar next_pos
-      local_next_pos = next_pos
-      if model_mode == MODEL_MODE_AUTOREGRESSIVE and q_seq_len == 1:
-        local_next_pos = s_len - 1
-
-      row_ids = jax.lax.broadcasted_iota(jnp.int32, (q_seq_len, s_len), 0) + local_next_pos
+      row_ids = get_ar_row_ids(s_len)
       col_ids = jax.lax.broadcasted_iota(jnp.int32, (1, s_len), 1)
       
       uncompressed_mask = col_ids <= row_ids
       if self.sliding_window_size is not None:
         uncompressed_mask = uncompressed_mask & (col_ids > (row_ids - self.sliding_window_size))
 
-      # Native 5D cast: (1, 1, 1, Q, K)
-      uncompressed_mask_5d = uncompressed_mask[None, None, None, :, :]
+      if uncompressed_mask.ndim == 3:
+          uncompressed_mask_5d = uncompressed_mask[:, None, None, :, :]
+      else:
+          uncompressed_mask_5d = uncompressed_mask[None, None, None, :, :]
       
       # Broadcast the batch/head dimensions to match compressed_mask so jnp.concatenate succeeds
       target_shape = compressed_mask.shape[:-1] + (s_len,)
