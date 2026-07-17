@@ -1279,6 +1279,7 @@ class NNXDecoder(nnx.Module):
             "qwen3-omni-30b-a3b",
             "qwen3-vl-2b",
             "qwen3-vl-4b",
+            "qwen3-vl-30b-a3b",
             "qwen3.5-35b-a3b",
             "qwen3.5-397b-a17b",
         }:

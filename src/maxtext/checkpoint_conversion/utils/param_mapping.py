@@ -3680,8 +3680,9 @@ def QWEN3_VL_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=Fal
   mapping = {}
 
   n_layers_text = config["text_config"]["num_hidden_layers"]
+  num_experts_text = config["text_config"].get("num_local_experts", 0)
   text_mapping = QWEN_MAXTEXT_TO_HF_PARAM_MAPPING(
-      config={"num_hidden_layers": n_layers_text},
+      config={"num_hidden_layers": n_layers_text, "num_experts": num_experts_text},
       maxtext_config=maxtext_config,
       scan_layers=scan_layers,
   )
@@ -3764,8 +3765,9 @@ def QWEN3_VL_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=Fal
   mapping = {}
 
   n_layers_text = config["text_config"]["num_hidden_layers"]
+  num_experts_text = config["text_config"].get("num_local_experts", 0)
   text_hooks = QWEN_MAXTEXT_TO_HF_PARAM_HOOK_FN(
-      config={"num_hidden_layers": n_layers_text},
+      config={"num_hidden_layers": n_layers_text, "num_experts": num_experts_text},
       maxtext_config=maxtext_config,
       scan_layers=scan_layers,
       saving_to_hf=saving_to_hf,
@@ -4169,6 +4171,7 @@ PARAM_MAPPING = {
     "qwen3-32b": QWEN_MAXTEXT_TO_HF_PARAM_MAPPING,
     "qwen3-vl-2b": QWEN3_VL_MAXTEXT_TO_HF_PARAM_MAPPING,
     "qwen3-vl-4b": QWEN3_VL_MAXTEXT_TO_HF_PARAM_MAPPING,
+    "qwen3-vl-30b-a3b": QWEN3_VL_MAXTEXT_TO_HF_PARAM_MAPPING,
     "llama3.1-8b": LLAMA31_MAXTEXT_TO_HF_PARAM_MAPPING,
     "llama3.1-8b-Instruct": LLAMA31_MAXTEXT_TO_HF_PARAM_MAPPING,
     "llama3.1-70b": LLAMA31_MAXTEXT_TO_HF_PARAM_MAPPING,
@@ -4222,6 +4225,7 @@ HOOK_FNS = {
     "qwen3-32b": QWEN_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "qwen3-vl-2b": QWEN3_VL_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "qwen3-vl-4b": QWEN3_VL_MAXTEXT_TO_HF_PARAM_HOOK_FN,
+    "qwen3-vl-30b-a3b": QWEN3_VL_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "llama3.1-8b": LLAMA31_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "llama3.1-8b-Instruct": LLAMA31_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "llama3.1-70b": LLAMA31_MAXTEXT_TO_HF_PARAM_HOOK_FN,
