@@ -27,6 +27,7 @@ from flax import nnx
 from maxtext.common.common_types import Config, Array
 from maxtext.layers import initializers as max_initializers
 from maxtext.layers import nnx_wrappers
+from maxtext.layers.linears import MlpBlock
 from maxtext.layers.normalizations import Qwen3NextRMSNorm
 from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.utils import max_utils
@@ -171,8 +172,26 @@ class Qwen3_5DecoderLayer(nnx.Module):
         rngs=rngs,
     )
 
-    # Instantiate our `Qwen3_5SparseMoEBlock`.
-    self.mlp = Qwen3_5SparseMoEBlock(config=cfg, mesh=self.mesh, quant=self.quant, rngs=rngs)
+    # Instantiate the MLP block. MoE variants (e.g. Qwen3.5-35B-A3B) use the
+    # `Qwen3_5SparseMoEBlock`; dense variants (e.g. Qwen3.5-27B / -9B, config
+    # with num_experts <= 1) share the hybrid attention stack but use a
+    # standard SwiGLU `MlpBlock` (mirrors the dense Qwen3 decoder layer).
+    if cfg.num_experts > 1:
+      self.mlp = Qwen3_5SparseMoEBlock(config=cfg, mesh=self.mesh, quant=self.quant, rngs=rngs)
+    else:
+      self.mlp = MlpBlock(
+          config=cfg,
+          mesh=self.mesh,
+          in_features=cfg.emb_dim,
+          intermediate_dim=cfg.mlp_dim,
+          activations=cfg.mlp_activations,
+          intermediate_dropout_rate=cfg.dropout_rate,
+          dtype=cfg.dtype,
+          weight_dtype=cfg.weight_dtype,
+          quant=self.quant,
+          model_mode=self.model_mode,
+          rngs=rngs,
+      )
 
   def __call__(
       self,
@@ -226,8 +245,12 @@ class Qwen3_5DecoderLayer(nnx.Module):
     hidden_states = self.post_attention_layernorm(hidden_states)
     hidden_states = nn.with_logical_constraint(hidden_states, self.activation_axis_names)
 
-    # Instantiate and call our `Qwen3_5SparseMoEBlock`.
-    mlp_output, load_balance_loss = self.mlp(hidden_states, deterministic=deterministic)
+    # Apply the MLP block (MoE for expert configs, dense MlpBlock otherwise).
+    if isinstance(self.mlp, Qwen3_5SparseMoEBlock):
+      mlp_output, load_balance_loss = self.mlp(hidden_states, deterministic=deterministic)
+    else:
+      mlp_output = self.mlp(hidden_states, deterministic=deterministic)
+      load_balance_loss = None
 
     # We sow the load balancing loss so it can be collected and added to the total loss
     # during training.
