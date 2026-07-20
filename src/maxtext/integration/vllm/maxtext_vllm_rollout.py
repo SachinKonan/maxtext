@@ -136,13 +136,13 @@ def unroll_gemma_scanned_weights(weights):
 
           for i in range(scan_length):
             global_idx = i * pattern_length + layer_sub_idx
-            new_key = tuple(list(k[: dec_idx + 1]) + ["layers", global_idx] + list(k[dec_idx + 3 :]))
+            new_key = tuple(list(k[: dec_idx + 1]) + ["layers", str(global_idx)] + list(k[dec_idx + 3 :]))
             new_flat_w[new_key] = unstacked[i]
 
             if unrolled_count < 5:
               old_shape = v.shape if hasattr(v, "shape") else "scalar"
               new_shape = unstacked[i].shape if hasattr(unstacked[i], "shape") else "scalar"
-              logging.info(
+              logging.warning(
                   "MaxTextVllmSampler Unrolled: %s from src %s. Old shape: %s, New shape: %s",
                   new_key,
                   k,
@@ -160,7 +160,7 @@ def unroll_gemma_scanned_weights(weights):
         ):
           layer_sub_idx = int(k[dec_idx + 2].split("layers_")[-1])
           global_idx = scan_length * pattern_length + layer_sub_idx
-          new_key = tuple(list(k[: dec_idx + 1]) + ["layers", global_idx] + list(k[dec_idx + 3 :]))
+          new_key = tuple(list(k[: dec_idx + 1]) + ["layers", str(global_idx)] + list(k[dec_idx + 3 :]))
           new_flat_w[new_key] = v
           unrolled_count += 1
           is_unrolled = True
@@ -170,7 +170,7 @@ def unroll_gemma_scanned_weights(weights):
     if not is_unrolled:
       new_flat_w[k] = v
 
-  logging.info(
+  logging.warning(
       "MaxTextVllmSampler: Successfully unrolled %s scanned tensor components into vLLM-compatible nnx.List format.",
       unrolled_count,
   )
@@ -206,6 +206,26 @@ class MaxTextVllmSampler(VllmSampler):
       # before handing them off to the base tunix sampler which assumes
       # flat layers or simple homogeneous scans.
       updated_weights = unroll_gemma_scanned_weights(updated_weights)
+
+      # Strict validation to prevent silent gibberish bug
+      target_state = getattr(self._model_runner, "state", None)
+      if target_state is not None:
+        src_pure = updated_weights.to_pure_dict() if hasattr(updated_weights, "to_pure_dict") else updated_weights
+        if isinstance(src_pure, dict) and "base" in src_pure:
+          src_pure = src_pure["base"]
+        flat_src = flatten_dict(src_pure, sep=None)
+        flat_tgt = flatten_dict(target_state, sep=None)
+
+        # Check for intersection. If 0 parameters intersect, Tunix will silently drop everything.
+        intersect_count = sum(1 for k in flat_tgt if k in flat_src)
+        if intersect_count == 0:
+          raise ValueError(
+              "CRITICAL ERROR: Weight synchronization failed! 0 parameters matched between the RL Actor "
+              f"(e.g. {next(iter(flat_src.keys()))}) and the vLLM engine (e.g. {next(iter(flat_tgt.keys()))}). "
+              "This will cause the model to output gibberish. Check if unroll_gemma_scanned_weights correctly "
+              "mapped integer keys to strings."
+          )
+
       super().update_params(updated_weights, filter_types)
       return
 
