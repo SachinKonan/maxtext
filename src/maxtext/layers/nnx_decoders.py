@@ -889,8 +889,19 @@ class NNXDecoder(nnx.Module):
           gpt3.Gpt3LayerNorm, num_features=num_features, reductions_in_fp32=False, use_bias=True, rngs=rngs
       )
     elif self.config.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.QWEN3_5):
+      # Qwen3-Next / Qwen3.5 use ZERO-CENTERED RMSNorm everywhere, including
+      # the final decoder norm: HF stores w with effective scale (1 + w), and
+      # checkpoint conversion maps model.norm.weight directly. The linen
+      # decoder already uses Qwen3NextRMSNormLinen (scale_offset=1.0) here;
+      # the pure-NNX path used a plain RMSNorm, silently rescaling the LM-head
+      # input per channel (measured ~2 nats/token logprob divergence vs HF on
+      # Qwen3.5-27B while per-layer activations matched exactly).
       return functools.partial(
-          normalizations.RMSNorm, num_features=num_features, shard_mode=self.config.shard_mode, rngs=rngs
+          normalizations.RMSNorm,
+          num_features=num_features,
+          shard_mode=self.config.shard_mode,
+          scale_offset=1.0,
+          rngs=rngs,
       )
     else:
       raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
