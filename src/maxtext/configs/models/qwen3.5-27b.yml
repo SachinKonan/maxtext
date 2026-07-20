@@ -65,5 +65,16 @@ deepstack_visual_indexes_for_vit: []  # No deepstack for Qwen3.5 VL
 rope_theta_for_vit: 10000
 
 # MRoPE Settings (Multi-dimensional RoPE for multimodal)
-use_mrope: true
+#
+# use_mrope MUST stay false for text-only use: HF interleaved mrope with
+# text positions (t,t,t) degenerates to plain partial RoPE (first
+# head_dim*partial_rotary_factor = 64 dims, freq ladder over 32 pairs),
+# which is exactly the PartialRotaryEmbedding the is_qwen3_hybrid branch
+# builds. The use_mrope branch in attentions.init_rotary_embedding takes
+# precedence and rotates the FULL 256-dim head (ignores
+# partial_rotary_factor), which diverges from HF/vLLM logits
+# (measured ~2 nats/token on-policy KL on Qwen3.5-27B).
+# Flip to true only for real multimodal training with 3-D positions after
+# fixing the mrope embedding to honor partial_rotary_factor.
+use_mrope: false
 mrope_section: [11, 11, 10]
