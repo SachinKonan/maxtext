@@ -980,26 +980,6 @@ class KVCache(BaseCache):
       return self.kv_cache_autoregressive(key, value, use_ragged_attention)
     
     incoming_batch = key.shape[0]
-    
-    # Safely stretch or slice the custom V4 arrays to match the runtime batch
-    def align_var(cache_var):
-      val = cache_var.get_value()
-      if val.shape[0] != incoming_batch:
-        if val.shape[0] == 1:
-          val = jnp.repeat(val, incoming_batch, axis=0)
-        elif val.shape[0] < incoming_batch:
-          pad_amt = incoming_batch - val.shape[0]
-          val = jnp.pad(val, ((0, pad_amt),) + ((0, 0),) * (val.ndim - 1))
-        else:
-          val = val[:incoming_batch]
-        cache_var.set_value(val)
-
-    align_var(self.leftover_buffer_kv)
-    align_var(self.leftover_buffer_gate)
-    align_var(self.overlap_kv)
-    align_var(self.overlap_gate)
-    align_var(self.entry_count)
-    align_var(self.accumulator_index)
 
     # 1. Update the Accumulator Buffers
     current_index_array = self.accumulator_index.get_value()
@@ -1068,8 +1048,6 @@ class KVCache(BaseCache):
     indicator_to_write = jnp.where(window_complete, active_indicator, zero_indicator)
 
     temp_ar_seg = cached_ar_segment_id_var.get_value()
-    if temp_ar_seg.shape[0] != active_indicator.shape[0]:
-        temp_ar_seg = jnp.broadcast_to(temp_ar_seg, (active_indicator.shape[0],) + temp_ar_seg.shape[1:])
 
     new_ar_seg = jax.lax.dynamic_update_index_in_dim(
         temp_ar_seg, indicator_to_write, jnp.squeeze(ar_index), 1

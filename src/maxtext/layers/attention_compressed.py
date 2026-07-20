@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import Mesh
+from maxtext.utils import max_utils
 
 from flax import nnx
 
@@ -343,9 +344,6 @@ class DeepseekV4HCACompressor(BaseDeepseekCompressor):
             update_blocks = jnp.pad(update_blocks, ((0, 0), (0, 0), (0, 0), (0, pad_amt)))
 
         operand = cache_key_var.get_value()
-        batch_axis = cache.prefill_cache_axis_order.index(0)
-        if operand.shape[batch_axis] != update_blocks.shape[batch_axis]:
-          operand = jnp.repeat(operand, update_blocks.shape[batch_axis], axis=batch_axis)
         
         # Insert along the sequence axis (which is axis=0 in the transposed shape)
         cache_key_var.set_value(
@@ -608,11 +606,7 @@ class DeepseekV4Indexer(nnx.Module):
           
           # 4. Insert along the Sequence axis (which is now axis=0)
           operand = cache_key_var.get_value()
-          batch_axis = cache.prefill_cache_axis_order.index(0)
-          if operand.shape[batch_axis] != update_blocks.shape[batch_axis]:
-            operand = jnp.repeat(operand, update_blocks.shape[batch_axis], axis=batch_axis)
-
-          # 4. Insert along the Sequence axis (which is now axis=0)
+          
           cache_key_var.set_value(
               jax.lax.dynamic_update_slice_in_dim(operand, update_blocks, 0, axis=0)
           )
@@ -833,11 +827,7 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
           
           # Insert along the sequence axis (which is axis=0 in the transposed shape)
           operand = cache_key_var.get_value()
-          batch_axis = cache.prefill_cache_axis_order.index(0)
-          if operand.shape[batch_axis] != update_blocks.shape[batch_axis]:
-            operand = jnp.repeat(operand, update_blocks.shape[batch_axis], axis=batch_axis)
-
-          # Insert along the sequence axis (which is axis=0 in the transposed shape)
+          
           cache_key_var.set_value(
               jax.lax.dynamic_update_slice_in_dim(operand, update_blocks, 0, axis=0)
           )
@@ -1118,7 +1108,11 @@ class CompressedAttention(Attention):
     )
 
     if self.model_mode != MODEL_MODE_TRAIN and self.compress_ratio > 0:
-      batch_size = inputs_q_shape[0]
+      batch_size, _ = max_utils.get_batch_seq_len_for_mode(self.config, MODEL_MODE_AUTOREGRESSIVE)
+
+      # ADD THIS PRINT: Now logging model_mode as well
+      print(f"\n[TRACE DEBUG] Initializing compressor_cache with batch_size: {batch_size} | model_mode: {self.model_mode}\n")
+
       max_prefill_comp = max(1, self.max_prefill_predict_length // self.compress_ratio)
       max_target_comp = max(max_prefill_comp + 1, self.max_target_length // self.compress_ratio)
 
