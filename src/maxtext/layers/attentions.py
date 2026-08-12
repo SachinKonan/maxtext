@@ -320,6 +320,10 @@ class Attention(nnx.Module):
       rope_max_timescale: float | None = None,
       partial_rotary_factor: float | None = None,
       share_kv_layer: bool = False,
+      # Muse-Glimmer style sigmoid output gate: a separate [emb] -> [heads, head_dim]
+      # projection of the *attention input* whose sigmoid multiplies the attention
+      # output elementwise BEFORE the out projection.
+      use_attn_output_gate: bool = False,
       rngs: nnx.Rngs | None = None,
   ):
     """Initializes the Attention module.
@@ -427,6 +431,7 @@ class Attention(nnx.Module):
     self.rope_max_timescale = rope_max_timescale if rope_max_timescale is not None else self.config.rope_max_timescale
     self.partial_rotary_factor = partial_rotary_factor
     self.share_kv_layer = share_kv_layer
+    self.use_attn_output_gate = use_attn_output_gate
 
     self.is_qwen2 = self.config.decoder_block == DecoderBlockType.QWEN2
     self.is_qwen3_hybrid = (
@@ -566,6 +571,28 @@ class Attention(nnx.Module):
         if not self.share_kv_projections:
           self.value = self.init_kv_w(inputs_kv_shape=inputs_kv_shape)
     self.out = self.init_out_w(output_dim=inputs_q_shape[-1])
+    if self.use_attn_output_gate:
+      self.attn_gate = self.init_attn_gate_w(inputs_q_shape=inputs_q_shape)
+
+  def init_attn_gate_w(self, inputs_q_shape: Tuple) -> nnx.Module:
+    """Sigmoid output-gate projection (Muse-Glimmer): [.., emb] -> [.., heads, head_dim]."""
+    kernel_axes = (
+        (None, None, None) if self.config.ici_context_autoregressive_parallelism > 1 else ("embed", "q_heads", "kv")
+    )
+    return DenseGeneral(
+        in_features_shape=self.convert_dense_general_inputs_shape(inputs_q_shape),
+        out_features_shape=(self.num_query_heads, self.head_dim),
+        axis=-1,
+        kernel_init=self.kernel_init,
+        kernel_axes=kernel_axes,
+        dtype=self.dtype,
+        weight_dtype=self.weight_dtype,
+        quant=self.quant,
+        matmul_precision=self.config.matmul_precision,
+        use_bias=False,
+        shard_mode=self.config.shard_mode,
+        rngs=self.rngs,
+    )
 
   def init_query_w(self, inputs_q_shape: Tuple) -> nnx.Module:
     """Query projection initialization."""
@@ -1243,6 +1270,12 @@ class Attention(nnx.Module):
     if self.is_qwen3_hybrid:
       out = out.reshape(batch_size, seq_len, self.config.num_query_heads * self.config.head_dim)
       out = out * jax.nn.sigmoid(gate)
+    if self.use_attn_output_gate:
+      # Muse-Glimmer: gate is computed from the *attention input* (post input-layernorm
+      # activations), NOT from the attention output, and is applied before out_projection.
+      # `out` is [b, s, n_heads, head_dim]; the gate projection has the identical layout,
+      # so this matches HF's flattened `attn_output * sigmoid(gate_proj(hidden_states))`.
+      out = out * jax.nn.sigmoid(self.attn_gate(inputs_q).astype(out.dtype))
     out = self.out_projection(out, out_sharding=out_sharding)
     if self.config.distill_beta > 0.0:
       self.sow(nnx.Intermediate, "out_projection_activations", out)

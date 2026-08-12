@@ -86,6 +86,10 @@ HF_IDS = {
     "olmo3-7b": "allenai/Olmo-3-7B-Instruct",
     "olmo3-7b-pt": "allenai/Olmo-3-1025-7B",
     "olmo3-32b": "allenai/Olmo-3-32B-Think",
+    "muse-glimmer-30b": "meta-models/Muse-Glimmer-30B",
+    # Tiny random-weight parity model; no HF repo. The parity harness always passes
+    # an explicit --hf_model_path / tokenizer, so this is only a placeholder.
+    "muse-glimmer-tiny": "meta-models/Muse-Glimmer-30B",
     # "default" is not HF model, but adding to to avoid confusing warning about tokenizer_path
     "default": os.path.join(MAXTEXT_ASSETS_ROOT, "tokenizers/tokenizer.llama2"),
 }

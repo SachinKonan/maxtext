@@ -1548,6 +1548,88 @@ olmo3_32b_dict = {
 olmo3_32b_config = transformers.Olmo3Config(**olmo3_32b_dict)
 
 
+# ---------------------------------------------------------------------------
+# Muse-Glimmer (text tower only). Values verbatim from config.json["text_config"]
+# of meta-models/Muse-Glimmer-30B. The vision tower is deliberately absent: this
+# port is text-only, and `to_maxtext.py` is run with `use_multimodal=false`, so
+# the converter never touches `model.vision_*`.
+#
+# NOTE the two flat mirrors: the converter's PARAM_MAPPING/HOOK_FNS read
+# `config["num_hidden_layers"]` etc. off the TOP level of `.to_dict()`, while a
+# real `MuseGlimmerConfig` nests them under "text_config". We therefore keep both
+# the nested block (for fidelity / `text_config` consumers) and the flat keys.
+# ---------------------------------------------------------------------------
+muse_glimmer_text_dict = {
+    "model_type": "muse_glimmer_text",
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "bos_token_id": 200000,
+    "eos_token_id": 200001,
+    "final_logit_softcapping": 20.0,
+    "head_dim": 128,
+    "hidden_activation": "silu",
+    "hidden_size": 6656,
+    "initializer_range": 0.02,
+    "intermediate_size": 19968,
+    "layer_rope_theta": [0 if (i % 4) == 3 else 500000.0 for i in range(52)],
+    "layer_types": ["full_attention" if (i % 4) == 3 else "sliding_attention" for i in range(52)],
+    "max_position_embeddings": 131072,
+    "num_attention_heads": 32,
+    "num_hidden_layers": 52,
+    "num_key_value_heads": 2,
+    "output_multiplier": 0.19611613513818404,
+    "pad_token_id": None,
+    "post_norm_eps": 1e-08,
+    "qk_scale_factor": 3.87,
+    "rms_norm_eps": 1e-05,
+    "rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"},
+    "sliding_window": 2048,
+    "tie_word_embeddings": False,
+    "use_cache": True,
+    "vocab_size": 202048,
+}
+
+muse_glimmer_30b_dict = {
+    "architectures": ["MuseGlimmerForConditionalGeneration"],
+    "dtype": "bfloat16",
+    "model_type": "muse_glimmer",
+    "text_config": muse_glimmer_text_dict,
+    **muse_glimmer_text_dict,
+}
+
+# Same constants, tiny shapes -- used by the CPU HF-parity harness. Keeps the
+# [S,S,S,F] cycle (one repeat) so both attention types and NoPE are exercised.
+muse_glimmer_tiny_text_dict = {
+    **muse_glimmer_text_dict,
+    "hidden_size": 256,
+    "intermediate_size": 512,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 1,
+    "head_dim": 64,
+    "num_hidden_layers": 4,
+    "vocab_size": 512,
+    "sliding_window": 8,
+    "max_position_embeddings": 4096,
+    "layer_rope_theta": [0 if (i % 4) == 3 else 500000.0 for i in range(4)],
+    "layer_types": ["full_attention" if (i % 4) == 3 else "sliding_attention" for i in range(4)],
+}
+muse_glimmer_tiny_dict = {
+    "architectures": ["MuseGlimmerForConditionalGeneration"],
+    "dtype": "float32",
+    "model_type": "muse_glimmer",
+    "text_config": muse_glimmer_tiny_text_dict,
+    **muse_glimmer_tiny_text_dict,
+}
+
+try:
+  # Succeeds once transformers ships Muse-Glimmer (5.15.0.dev0+).
+  muse_glimmer_30b_config = transformers.MuseGlimmerConfig(**muse_glimmer_30b_dict)
+  muse_glimmer_tiny_config = transformers.MuseGlimmerConfig(**muse_glimmer_tiny_dict)
+except (AttributeError, TypeError):
+  muse_glimmer_30b_config = PTConfig(**muse_glimmer_30b_dict)  # pytype: disable=wrong-arg-types
+  muse_glimmer_tiny_config = PTConfig(**muse_glimmer_tiny_dict)  # pytype: disable=wrong-arg-types
+
+
 # {maxtext model name: hf model config}
 HF_MODEL_CONFIGS = {
     "gemma2-2b": gemma2_2b_config,
@@ -1596,4 +1678,6 @@ HF_MODEL_CONFIGS = {
     "olmo3-7b": olmo3_7b_config,
     "olmo3-7b-pt": olmo3_7b_config,
     "olmo3-32b": olmo3_32b_config,
+    "muse-glimmer-30b": muse_glimmer_30b_config,
+    "muse-glimmer-tiny": muse_glimmer_tiny_config,
 }

@@ -1,0 +1,60 @@
+# Copyright 2023-2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# model config for Muse-Glimmer-30B -- TEXT TOWER ONLY (no vision).
+# Values copied verbatim from config.json["text_config"] of meta-models/Muse-Glimmer-30B.
+
+decoder_block: "muse_glimmer"
+
+base_num_decoder_layers: 52
+base_emb_dim: 6656
+base_num_query_heads: 32
+base_num_kv_heads: 2
+head_dim: 128
+base_mlp_dim: 19968
+mlp_activations: ["silu", "linear"]   # SwiGLU: wi_0=gate_proj, wi_1=up_proj, wo=down_proj
+vocab_size: 202048
+
+# Norms. rms_norm_eps everywhere EXCEPT the two POST (sandwich) norms, which use
+# post_norm_eps = 1e-8. The four per-layer norms are zero-centred `(1 + w)`; the
+# final `model.norm` is a plain `n * w` (see models/muse_glimmer.py).
+normalization_layer_epsilon: 1.e-05
+post_norm_layer_epsilon: 1.e-08
+
+# Attention. layer_types = [sliding, sliding, sliding, full] x 13, and
+# layer_rope_theta = [5e5, 5e5, 5e5, 0] x 13 -- so the full layers are exactly the
+# NoPE layers. Both are derived from MUSE_GLIMMER_ATTENTION_PATTERN in
+# models/muse_glimmer.py; one scanned block == one [S,S,S,F] cycle.
+inhomogeneous_layer_cycle_interval: 4
+sliding_window_size: 2048
+attention_bias: false
+# Parameter-free per-head RMSNorm on q and k (absent from the checkpoint).
+use_qk_norm: true
+qk_norm_with_scale: false
+# q (and only q) is additionally scaled by 3.87 after the qk-norm. This is folded
+# together with the head_dim**-0.5 softmax scaling into query_pre_attn_scalar.
+qk_scale_factor: 3.87
+
+# RoPE (default/NeoX-style, theta 500000) on the sliding layers only.
+rope_type: "default"
+rope_max_timescale: 500000
+max_position_embeddings: 131072
+
+# Output head. lm_head is a SEPARATE tensor in the released checkpoint
+# (tie_word_embeddings=false, and model.safetensors.index.json lists
+# lm_head.weight independently of model.language_model.embed_tokens.weight).
+logits_via_embedding: false
+normalize_embedding_logits: false
+logits_output_multiplier: 0.19611613513818404
+final_logits_soft_cap: 20.0

@@ -3663,6 +3663,157 @@ def OLMO3_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False,
   return hooks
 
 
+
+def MUSE_GLIMMER_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=False):
+  """MaxText <-> HuggingFace weight paths for the Muse-Glimmer TEXT tower.
+
+  HF names are exactly those in `model.safetensors.index.json`, i.e. the text tower
+  lives under `model.language_model.*` because the released checkpoint is the
+  multimodal `MuseGlimmerForConditionalGeneration`. `lm_head.weight` is a SEPARATE
+  tensor (`tie_word_embeddings: false`) and is mapped to `logits_dense`.
+
+  Naming trap: HF has BOTH `self_attn.gate_proj` (the sigmoid attention gate) and
+  `mlp.gate_proj` (SwiGLU). They map to two completely different MaxText params --
+  `attention-attn_gate-kernel` and `mlp-wi_0-kernel` respectively.
+  """
+  text_config = config.get("text_config", config)
+  n_layers = text_config["num_hidden_layers"]
+  # maxtext_config is None when called from tunix's VllmWeightMapping.
+  layer_cycle_interval = getattr(maxtext_config, "inhomogeneous_layer_cycle_interval", 4)
+
+  # Vision-tower checkpoints nest the text tower one level deeper.
+  text_base = "model.language_model" if config.get("vision_config") or "text_config" in config else "model"
+
+  mapping = {
+      "params-token_embedder-embedding": f"{text_base}.embed_tokens.weight",
+      "params-decoder-decoder_norm-scale": f"{text_base}.norm.weight",
+      "params-decoder-logits_dense-kernel": "lm_head.weight",
+  }
+
+  def layer_block(prefix, hf_names):
+    """hf_names(suffix) -> str | list[str]; one entry per HF layer behind `prefix`."""
+    return {
+        # --- attention -------------------------------------------------------
+        f"{prefix}-self_attention-query-kernel": hf_names("self_attn.q_proj.weight"),
+        f"{prefix}-self_attention-key-kernel": hf_names("self_attn.k_proj.weight"),
+        f"{prefix}-self_attention-value-kernel": hf_names("self_attn.v_proj.weight"),
+        f"{prefix}-self_attention-out-kernel": hf_names("self_attn.o_proj.weight"),
+        # sigmoid output gate -- self_attn.gate_proj, NOT mlp.gate_proj
+        f"{prefix}-self_attention-attn_gate-kernel": hf_names("self_attn.gate_proj.weight"),
+        # --- MLP (SwiGLU): wi_0 = gate_proj, wi_1 = up_proj, wo = down_proj ---
+        f"{prefix}-mlp-wi_0-kernel": hf_names("mlp.gate_proj.weight"),
+        f"{prefix}-mlp-wi_1-kernel": hf_names("mlp.up_proj.weight"),
+        f"{prefix}-mlp-wo-kernel": hf_names("mlp.down_proj.weight"),
+        # --- sandwich norms --------------------------------------------------
+        f"{prefix}-pre_self_attention_norm-scale": hf_names("input_layernorm.weight"),
+        f"{prefix}-post_self_attention_norm-scale": hf_names("post_attention_layernorm.weight"),
+        f"{prefix}-pre_ffw_norm-scale": hf_names("pre_feedforward_layernorm.weight"),
+        f"{prefix}-post_ffw_norm-scale": hf_names("post_feedforward_layernorm.weight"),
+    }
+    # NOTE: q_norm / k_norm are deliberately absent -- Muse-Glimmer's qk-norm is
+    # parameter-free (`MuseGlimmerRMSNorm(with_scale=False)`) and no such tensor
+    # exists in the checkpoint. MaxText matches via `qk_norm_with_scale: false`.
+
+  if scan_layers:
+    # One scanned block == one [S,S,S,F] cycle; sub-layer k of the block collects
+    # HF layers k, k+cycle, k+2*cycle, ...
+    for cycle_idx in range(layer_cycle_interval):
+      hf_indices = list(range(cycle_idx, n_layers, layer_cycle_interval))
+      prefix = f"params-decoder-layers-layers_{cycle_idx}"
+      mapping.update(
+          layer_block(prefix, lambda suf, idx=hf_indices: [f"{text_base}.layers.{i}.{suf}" for i in idx])
+      )
+  else:
+    for i in range(n_layers):
+      prefix = f"params-decoder-layers_{i}"
+      mapping.update(layer_block(prefix, lambda suf, i=i: f"{text_base}.layers.{i}.{suf}"))
+
+  return mapping
+
+
+def MUSE_GLIMMER_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False, saving_to_hf=False):
+  """Per-tensor transforms for Muse-Glimmer."""
+
+  def reshape_kernel(input_tensor, target_shape):
+    # HF stores nn.Linear as [out, in]; MaxText DenseGeneral kernels are [in, ...out].
+    if saving_to_hf:
+      flipped_target_shape = np.flip(np.array(target_shape))
+      return input_tensor.reshape(flipped_target_shape).T
+    else:
+      return input_tensor.T.reshape(target_shape)
+
+  def scale_rmsnorm_layer(input_tensor, target_shape):
+    # The four per-layer norms are zero-centred and MaxText applies `(1 + w)` via
+    # `scale_offset=1.0`, so the stored tensor is copied through unchanged. The
+    # final `decoder_norm` is a plain `n * w` with ones-centred weights -- also
+    # unchanged. Either way this is a pure reshape; do NOT add or subtract 1 here.
+    return input_tensor.reshape(target_shape)
+
+  def pad_hf_embedding_layer(input_tensor, target_shape):
+    # Vocab padding only. Unlike Gemma there is NO sqrt(hidden_size) scaling: the
+    # embedding is RMS-normed at runtime instead (MuseGlimmerTextNormedEmbedding).
+    source_vocab_size = input_tensor.shape[0]
+    target_vocab_size = target_shape[0]
+    if source_vocab_size == target_vocab_size:
+      return input_tensor
+    if saving_to_hf:
+      return input_tensor[:target_vocab_size, :]
+    padded_tensor = np.zeros(target_shape, dtype=input_tensor.dtype)
+    padded_tensor[:source_vocab_size, :] = input_tensor
+    return padded_tensor
+
+  def pad_logits_dense(input_tensor, target_shape):
+    # logits_dense kernel is [emb, vocab]; HF lm_head.weight is [vocab, emb].
+    if saving_to_hf:
+      return reshape_kernel(input_tensor, target_shape)
+    transposed = input_tensor.T  # -> [emb, vocab]
+    if transposed.shape == tuple(target_shape):
+      return transposed.reshape(target_shape)
+    padded = np.zeros(target_shape, dtype=transposed.dtype)
+    padded[:, : transposed.shape[1]] = transposed
+    return padded
+
+  hooks = {
+      "params-token_embedder-embedding": pad_hf_embedding_layer,
+      "params-decoder-logits_dense-kernel": pad_logits_dense,
+      "params-decoder-decoder_norm-scale": scale_rmsnorm_layer,
+  }
+
+  kernel_keys = [
+      "self_attention-query-kernel",
+      "self_attention-key-kernel",
+      "self_attention-value-kernel",
+      "self_attention-out-kernel",
+      "self_attention-attn_gate-kernel",
+      "mlp-wi_0-kernel",
+      "mlp-wi_1-kernel",
+      "mlp-wo-kernel",
+  ]
+  norm_keys = [
+      "pre_self_attention_norm-scale",
+      "post_self_attention_norm-scale",
+      "pre_ffw_norm-scale",
+      "post_ffw_norm-scale",
+  ]
+
+  text_config = config.get("text_config", config)
+  n_layers = text_config["num_hidden_layers"]
+  cycle_len = getattr(maxtext_config, "inhomogeneous_layer_cycle_interval", 4)
+
+  prefixes = (
+      [f"params-decoder-layers-layers_{c}" for c in range(cycle_len)]
+      if scan_layers
+      else [f"params-decoder-layers_{i}" for i in range(n_layers)]
+  )
+  for prefix in prefixes:
+    for key in kernel_keys:
+      hooks[f"{prefix}-{key}"] = reshape_kernel
+    for key in norm_keys:
+      hooks[f"{prefix}-{key}"] = scale_rmsnorm_layer
+
+  return hooks
+
+
 # {maxtext model name: {maxtext weight name: hf weight name}}
 PARAM_MAPPING = {
     "gemma2-2b": GEMMA2_MAXTEXT_TO_HF_PARAM_MAPPING,
@@ -3711,6 +3862,8 @@ PARAM_MAPPING = {
     "olmo3-7b": OLMO3_MAXTEXT_TO_HF_PARAM_MAPPING,
     "olmo3-7b-pt": OLMO3_MAXTEXT_TO_HF_PARAM_MAPPING,
     "olmo3-32b": OLMO3_MAXTEXT_TO_HF_PARAM_MAPPING,
+    "muse-glimmer-30b": MUSE_GLIMMER_MAXTEXT_TO_HF_PARAM_MAPPING,
+    "muse-glimmer-tiny": MUSE_GLIMMER_MAXTEXT_TO_HF_PARAM_MAPPING,
 }
 
 # {maxtext model name: {maxtext weight name: bi-directional transform}}
@@ -3761,6 +3914,8 @@ HOOK_FNS = {
     "olmo3-7b": OLMO3_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "olmo3-7b-pt": OLMO3_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "olmo3-32b": OLMO3_MAXTEXT_TO_HF_PARAM_HOOK_FN,
+    "muse-glimmer-30b": MUSE_GLIMMER_MAXTEXT_TO_HF_PARAM_HOOK_FN,
+    "muse-glimmer-tiny": MUSE_GLIMMER_MAXTEXT_TO_HF_PARAM_HOOK_FN,
 }
 
 VLLM_HOOK_FNS = {

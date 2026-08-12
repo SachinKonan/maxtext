@@ -57,6 +57,7 @@ from maxtext.models import (
     llama4,
     mistral,
     mixtral,
+    muse_glimmer,
     olmo3,
     qwen3,
     qwen3_5,
@@ -433,6 +434,11 @@ class NNXDecoder(nnx.Module):
             layer_kwargs = {"attention_type": gpt_oss.get_attention_type(layer_id=lyr)}
           elif config.decoder_block == DecoderBlockType.OLMO3:
             layer_kwargs = {"attention_type": olmo3.get_attention_type(layer_id=lyr)}
+          elif config.decoder_block == DecoderBlockType.MUSE_GLIMMER:
+            layer_kwargs = {
+                "attention_type": muse_glimmer.get_attention_type(layer_id=lyr),
+                "is_nope_layer": muse_glimmer.determine_is_nope_layer(layer_id=lyr),
+            }
 
           self._create_and_register_layer(layer_cls, rngs, "layers", lyr, **layer_kwargs)
 
@@ -737,6 +743,9 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.QWEN3_5: get_scannable(qwen3_5.Qwen3_5DecoderLayer, qwen3_5.Qwen3_5ScannableBlock),
         DecoderBlockType.LLAMA4: get_scannable(llama4.Llama4DecoderLayer, llama4.Llama4ScannableBlock),
         DecoderBlockType.OLMO3: get_scannable(olmo3.Olmo3DecoderLayer, olmo3.Olmo3ScannableBlock),
+        DecoderBlockType.MUSE_GLIMMER: get_scannable(
+            muse_glimmer.MuseGlimmerDecoderLayer, muse_glimmer.MuseGlimmerScannableBlock
+        ),
     }
 
     if cfg.decoder_block not in layer_map:
@@ -882,6 +891,10 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.SIMPLE_MLP,
         DecoderBlockType.LLAMA4,
         DecoderBlockType.OLMO3,
+        # Muse-Glimmer's FINAL norm (`model.norm`) is a *plain* RMSNorm (`n * w`,
+        # weights init to ones) -- only the four per-layer sandwich norms use the
+        # zero-centred `(1 + w)` convention. Do not "fix" this to a centred norm.
+        DecoderBlockType.MUSE_GLIMMER,
     ):
       return functools.partial(RMSNorm, num_features=num_features, shard_mode=self.config.shard_mode, rngs=rngs)
     elif self.config.decoder_block == DecoderBlockType.GPT3:
@@ -951,6 +964,12 @@ class NNXDecoder(nnx.Module):
     y = self.dropout(y, deterministic=deterministic)
     y = y.astype(cfg.dtype)
 
+    if cfg.decoder_block == DecoderBlockType.MUSE_GLIMMER:
+      # `MuseGlimmerTextNormedEmbedding`: parameter-free RMSNorm on the embedding
+      # lookup. Cannot be folded into the table (per-token nonlinearity), and there
+      # is NO sqrt(emb_dim) scaling here (unlike Gemma).
+      y = muse_glimmer.normed_embedding(y, cfg.normalization_layer_epsilon, cfg.dtype)
+
     if cfg.use_untrainable_positional_embedding:
       y += self.positional_embedding(y, decoder_positions)
 
@@ -998,6 +1017,13 @@ class NNXDecoder(nnx.Module):
         logits = jnp.tanh(logits) * cfg.final_logits_soft_cap
     else:
       logits = self.logits_dense(y, out_sharding=out_sharding)
+      # Muse-Glimmer: `logits * output_multiplier` and THEN the tanh softcap.
+      # Order matters; both are no-ops at their defaults (1.0 / 0.0).
+      if cfg.logits_output_multiplier != 1.0:
+        logits = logits * cfg.logits_output_multiplier
+      if cfg.final_logits_soft_cap:
+        logits = logits / cfg.final_logits_soft_cap
+        logits = jnp.tanh(logits) * cfg.final_logits_soft_cap
 
     if self.config.cast_logits_to_fp32:
       logits = logits.astype(jnp.float32)

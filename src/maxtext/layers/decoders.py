@@ -53,6 +53,7 @@ from maxtext.models import (
     llama4,
     mistral,
     mixtral,
+    muse_glimmer,
     olmo3,
     qwen2,
     qwen3,
@@ -493,6 +494,12 @@ class Decoder(nn.Module):
         return [llama4.Llama4ScannableBlockToLinen] if self.config.scan_layers else [llama4.Llama4DecoderLayerToLinen]
       case DecoderBlockType.OLMO3:
         return [olmo3.Olmo3ScannableBlockToLinen] if self.config.scan_layers else [olmo3.Olmo3DecoderLayerToLinen]
+      case DecoderBlockType.MUSE_GLIMMER:
+        return (
+            [muse_glimmer.MuseGlimmerScannableBlockToLinen]
+            if self.config.scan_layers
+            else [muse_glimmer.MuseGlimmerDecoderLayerToLinen]
+        )
 
       case _:
         # Default case to handle any unknown decoder block types.
@@ -548,6 +555,9 @@ class Decoder(nn.Module):
         DecoderBlockType.SIMPLE_MLP,
         DecoderBlockType.LLAMA4,
         DecoderBlockType.OLMO3,
+        # Muse-Glimmer's FINAL norm (`model.norm`) is a *plain* RMSNorm (`n * w`),
+        # not the zero-centred `(1 + w)` used by its four per-layer sandwich norms.
+        DecoderBlockType.MUSE_GLIMMER,
     ):
       return functools.partial(rms_norm, num_features=num_features, shard_mode=self.config.shard_mode)
     elif self.config.decoder_block == DecoderBlockType.GPT3:
@@ -698,6 +708,11 @@ class Decoder(nn.Module):
     y = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2,))(y, deterministic=deterministic)
     y = y.astype(cfg.dtype)
 
+    if cfg.decoder_block == DecoderBlockType.MUSE_GLIMMER:
+      # `MuseGlimmerTextNormedEmbedding`: parameter-free RMSNorm on the embedding
+      # lookup. NO sqrt(emb_dim) scaling here (unlike Gemma).
+      y = muse_glimmer.normed_embedding(y, cfg.normalization_layer_epsilon, cfg.dtype)
+
     if cfg.use_untrainable_positional_embedding:
       y += positional_embedding_as_linen(embedding_dims=cfg.base_emb_dim)(y.shape[1], decoder_positions)
 
@@ -773,6 +788,13 @@ class Decoder(nn.Module):
           y,
           out_sharding=out_sharding,
       )  # We do not quantize the logits matmul.
+      # Muse-Glimmer: `logits * output_multiplier` and THEN the tanh softcap.
+      # Order matters; both are no-ops at their defaults (1.0 / 0.0).
+      if cfg.logits_output_multiplier != 1.0:
+        logits = logits * cfg.logits_output_multiplier
+      if cfg.final_logits_soft_cap:
+        logits = logits / cfg.final_logits_soft_cap
+        logits = jnp.tanh(logits) * cfg.final_logits_soft_cap
 
     if self.config.cast_logits_to_fp32:
       logits = logits.astype(jnp.float32)
@@ -1147,6 +1169,11 @@ class Decoder(nn.Module):
               layer_kwargs = {"attention_type": gpt_oss.get_attention_type(layer_id=lyr)}
             if cfg.decoder_block == DecoderBlockType.OLMO3:
               layer_kwargs = {"attention_type": olmo3.get_attention_type(layer_id=lyr)}
+            if cfg.decoder_block == DecoderBlockType.MUSE_GLIMMER:
+              layer_kwargs = {
+                  "attention_type": muse_glimmer.get_attention_type(layer_id=lyr),
+                  "is_nope_layer": muse_glimmer.determine_is_nope_layer(layer_id=lyr),
+              }
             layer = RemattedBlockLayer(
                 config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant, model_mode=self.model_mode, **layer_kwargs
             )

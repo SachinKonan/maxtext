@@ -276,6 +276,8 @@ ModelName = Literal[
     "olmo3-7b",
     "olmo3-7b-pt",
     "olmo3-32b",
+    "muse-glimmer-30b",
+    "muse-glimmer-tiny",
 ]
 
 
@@ -502,6 +504,22 @@ class ModelArchitecture(BaseModel):
   )
 
   normalization_layer_epsilon: float = Field(1.0e-05, description="Epsilon value for normalization layers.")
+  post_norm_layer_epsilon: float = Field(
+      0.0,
+      description=(
+          "Epsilon for the POST (sandwich) normalization layers only, when it differs from "
+          "normalization_layer_epsilon. 0.0 means 'same as normalization_layer_epsilon'. "
+          "Muse-Glimmer uses 1e-8 here and 1e-5 everywhere else."
+      ),
+  )
+  qk_scale_factor: float = Field(
+      1.0,
+      description=(
+          "Extra scalar multiplied into the query after the qk-norm (Muse-Glimmer's "
+          "`qk_scale_factor`, 3.87). Separate from, and multiplied with, the head_dim**-0.5 "
+          "softmax scaling."
+      ),
+  )
   fused_qkv: bool = Field(False, description="If supported, fuse the Q, K, and V projections.")
   attention_bias: bool = Field(
       False,
@@ -542,6 +560,13 @@ class Logits(BaseModel):
   final_logits_soft_cap: None | NonNegativeFloat = Field(
       None,
       description="Soft-cap value for the final logits. None or 0.0 means no cap.",
+  )
+  logits_output_multiplier: float = Field(
+      1.0,
+      description=(
+          "Scalar applied to the logits BEFORE any final_logits_soft_cap (Muse-Glimmer's "
+          "`output_multiplier`, 0.19611613513818404). Order matters: multiply then softcap."
+      ),
   )
   z_loss_multiplier: float = Field(0.0, description="The multiplier for the z-loss (e.g., 1e-4). 0.0 to disable.")
 
