@@ -104,6 +104,48 @@ class RouteOutput:
   local_group_sizes: Optional[jax.Array] = None
 
 
+def _sparse_expert_lora_up(
+    inputs: jax.Array,
+    lora_a: jax.Array,
+    lora_b: jax.Array,
+    *,
+    gmm_fn,
+    tiling: tuple[int, ...],
+    weight_gather_axes: list[tuple[str, int]],
+    scale: float,
+) -> jax.Array:
+  """Applies a shared-A, expert-B LoRA update to sorted MoE tokens."""
+  low_rank = jnp.einsum("td,dr->tr", inputs, lora_a)
+  delta = gmm_fn(
+      low_rank,
+      lora_b,
+      tiling=tiling,
+      weight_gather_axes=weight_gather_axes,
+  )
+  return delta * jnp.asarray(scale, dtype=delta.dtype)
+
+
+def _sparse_expert_lora_down(
+    inputs: jax.Array,
+    lora_a: jax.Array,
+    lora_b: jax.Array,
+    *,
+    gmm_fn,
+    tiling: tuple[int, ...],
+    weight_gather_axes: list[tuple[str, int]],
+    scale: float,
+) -> jax.Array:
+  """Applies an expert-A, shared-B LoRA update to sorted MoE tokens."""
+  low_rank = gmm_fn(
+      inputs,
+      lora_a,
+      tiling=tiling,
+      weight_gather_axes=weight_gather_axes,
+  )
+  delta = jnp.einsum("tr,rd->td", low_rank, lora_b)
+  return delta * jnp.asarray(scale, dtype=delta.dtype)
+
+
 def _truncate_matrix(all_shards_group_sizes: jax.Array, buffer_size: int) -> jax.Array:
   """Truncates the traffic matrix to fit in buffer_size on receiver side.
 
@@ -1508,6 +1550,13 @@ class RoutedMoE(nnx.Module):
       w0_bias,
       w1_bias,
       wo_bias,
+      wi_0_lora_a=None,
+      wi_0_lora_b=None,
+      wi_1_lora_a=None,
+      wi_1_lora_b=None,
+      wo_lora_a=None,
+      wo_lora_b=None,
+      sparse_expert_lora_scale=0.0,
       input_ids=None,
       forced_routed_experts=None,
   ):
@@ -1799,6 +1848,28 @@ class RoutedMoE(nnx.Module):
         decoder_tokens_pspec,
     ) = get_routed_moe_shardings(is_batch_sharded_by_expert, input_ids is not None)
     w0_pspec, w1_pspec, wo_pspec = maybe_aqt_partition(w0_kernel, w0_pspec, w1_kernel, w1_pspec, wo_kernel, wo_pspec)
+    has_sparse_expert_lora = wi_0_lora_a is not None
+    sparse_expert_lora_factors = (
+        wi_0_lora_a,
+        wi_0_lora_b,
+        wi_1_lora_a,
+        wi_1_lora_b,
+        wo_lora_a,
+        wo_lora_b,
+    )
+    if has_sparse_expert_lora != all(factor is not None for factor in sparse_expert_lora_factors):
+      raise ValueError("Sparse expert LoRA requires all six wi_0/wi_1/wo factors")
+    if has_sparse_expert_lora:
+      # Shared factors are replicated at the shard_map boundary. Expert factors
+      # inherit the expert and output/contracting sharding of the base GMM
+      # weights, while the small rank dimension stays replicated.
+      wi_lora_a_pspec = P(None, None)
+      wi_lora_b_pspec = P(w0_pspec[0], None, w0_pspec[2])
+      wo_lora_a_pspec = P(wo_pspec[0], wo_pspec[1], None)
+      wo_lora_b_pspec = P(None, None)
+    else:
+      wi_lora_a_pspec = wi_lora_b_pspec = None
+      wo_lora_a_pspec = wo_lora_b_pspec = None
     output_pspec = self._logical_to_mesh_axes(
         (
             batch_logical_axis,
@@ -2059,6 +2130,11 @@ class RoutedMoE(nnx.Module):
       )
       return wi_gather_axes, wi_tile_size
 
+    def get_wi_lora_gmm_params():
+      """GMM parameters for B[e, rank, mlp]; rank is never gathered."""
+      gather_axes, tile_size = get_wi_gmm_params()
+      return [(axis, dim) for axis, dim in gather_axes if dim != 1], tile_size
+
     def get_wo_gmm_params():
       wo_gather_axes = []
       if weight_gather:
@@ -2084,6 +2160,11 @@ class RoutedMoE(nnx.Module):
       )
       return wo_gather_axes, wo_tile_size
 
+    def get_wo_lora_gmm_params():
+      """GMM parameters for A[e, mlp, rank]; rank is never gathered."""
+      gather_axes, tile_size = get_wo_gmm_params()
+      return [(axis, dim) for axis, dim in gather_axes if dim != 2], tile_size
+
     def gmm_up(
         x,
         w0,
@@ -2095,6 +2176,10 @@ class RoutedMoE(nnx.Module):
         partial_accum0=None,
         partial_accum1=None,
         mask=None,
+        wi_0_a=None,
+        wi_0_b=None,
+        wi_1_a=None,
+        wi_1_b=None,
     ):
       """Run the two up-projections (gate + up) and apply the FFN activation."""
       wi_gather_axes, wi_tile_size = get_wi_gmm_params()
@@ -2138,6 +2223,26 @@ class RoutedMoE(nnx.Module):
           if mask is not None:
             layer_w1 = jnp.where(mask[:, None], layer_w1, 0)
         layer_w1 = adc.checkpoint_name(layer_w1, "moe_mlpwi_1")
+      if wi_0_a is not None:
+        lora_gather_axes, lora_tile_size = get_wi_lora_gmm_params()
+        layer_w0 = layer_w0 + _sparse_expert_lora_up(
+            x,
+            wi_0_a,
+            wi_0_b,
+            gmm_fn=gmm_fn,
+            tiling=lora_tile_size,
+            weight_gather_axes=lora_gather_axes,
+            scale=sparse_expert_lora_scale,
+        )
+        layer_w1 = layer_w1 + _sparse_expert_lora_up(
+            x,
+            wi_1_a,
+            wi_1_b,
+            gmm_fn=gmm_fn,
+            tiling=lora_tile_size,
+            weight_gather_axes=lora_gather_axes,
+            scale=sparse_expert_lora_scale,
+        )
       return layer_w0, layer_w1
 
     def valid_token_count(x, routing, route_metadata):
@@ -2253,6 +2358,10 @@ class RoutedMoE(nnx.Module):
         sharded_input_ids,
         rngs,
         embed_dim,
+        wi_0_a=None,
+        wi_0_b=None,
+        wi_1_a=None,
+        wi_1_b=None,
         forced_routed_experts=None,
     ):
       """Overlap token all-gather and GMM computation along embedding dimension."""
@@ -2287,6 +2396,12 @@ class RoutedMoE(nnx.Module):
 
         cur_w0 = jax.lax.dynamic_slice_in_dim(w0, chunk_idx * chunk_dim, chunk_dim, axis=1)
         cur_w1 = jax.lax.dynamic_slice_in_dim(w1, chunk_idx * chunk_dim, chunk_dim, axis=1)
+        cur_wi_0_a = (
+            None if wi_0_a is None else jax.lax.dynamic_slice_in_dim(wi_0_a, chunk_idx * chunk_dim, chunk_dim, axis=0)
+        )
+        cur_wi_1_a = (
+            None if wi_1_a is None else jax.lax.dynamic_slice_in_dim(wi_1_a, chunk_idx * chunk_dim, chunk_dim, axis=0)
+        )
         gmm_fn = get_gmm_for_local_experts(cur_x, routing, route_metadata)
         next_ps0, next_ps1 = gmm_up(
             cur_x,
@@ -2298,6 +2413,10 @@ class RoutedMoE(nnx.Module):
             weight_gather,
             partial_accum0=ps0,
             partial_accum1=ps1,
+            wi_0_a=cur_wi_0_a,
+            wi_0_b=wi_0_b,
+            wi_1_a=cur_wi_1_a,
+            wi_1_b=wi_1_b,
         )
         next_x_unrouted = jax.lax.dynamic_slice_in_dim(x, (chunk_idx + 1) * chunk_dim, chunk_dim, axis=2)
         next_x, _, _ = roe_ag_and_route(
@@ -2321,6 +2440,16 @@ class RoutedMoE(nnx.Module):
       # gmm the last chunk
       last_w0 = jax.lax.dynamic_slice_in_dim(w0, (self.config.num_moe_emb_chunks - 1) * chunk_dim, chunk_dim, axis=1)
       last_w1 = jax.lax.dynamic_slice_in_dim(w1, (self.config.num_moe_emb_chunks - 1) * chunk_dim, chunk_dim, axis=1)
+      last_wi_0_a = (
+          None
+          if wi_0_a is None
+          else jax.lax.dynamic_slice_in_dim(wi_0_a, (self.config.num_moe_emb_chunks - 1) * chunk_dim, chunk_dim, axis=0)
+      )
+      last_wi_1_a = (
+          None
+          if wi_1_a is None
+          else jax.lax.dynamic_slice_in_dim(wi_1_a, (self.config.num_moe_emb_chunks - 1) * chunk_dim, chunk_dim, axis=0)
+      )
       gmm_fn = get_gmm_for_local_experts(last_x_chunk, routing, route_metadata)
       mask = (
           jnp.arange(last_x_chunk.shape[0]) < valid_token_count(last_x_chunk, routing, route_metadata)
@@ -2338,6 +2467,10 @@ class RoutedMoE(nnx.Module):
           partial_accum0=ps0,
           partial_accum1=ps1,
           mask=mask,
+          wi_0_a=last_wi_0_a,
+          wi_0_b=wi_0_b,
+          wi_1_a=last_wi_1_a,
+          wi_1_b=wi_1_b,
       )
       return output0, output1, gmm_fn, routing, route_metadata, wo_bias
 
@@ -2353,6 +2486,12 @@ class RoutedMoE(nnx.Module):
         wo_bias,
         sharded_input_ids,
         rngs,
+        wi_0_a=None,
+        wi_0_b=None,
+        wi_1_a=None,
+        wi_1_b=None,
+        wo_a=None,
+        wo_b=None,
         forced_routed_experts=None,
     ):
       batch_size, sequence_length, embed_dim = x.shape
@@ -2369,6 +2508,10 @@ class RoutedMoE(nnx.Module):
             sharded_input_ids,
             rngs,
             embed_dim,
+            wi_0_a=wi_0_a,
+            wi_0_b=wi_0_b,
+            wi_1_a=wi_1_a,
+            wi_1_b=wi_1_b,
             forced_routed_experts=forced_routed_experts,
         )
       else:
@@ -2386,7 +2529,20 @@ class RoutedMoE(nnx.Module):
           w0_bias, w1_bias, wo_bias = self.transform_bias(routing.selected_experts, w0_bias, w1_bias, wo_bias)
 
         gmm_fn = get_gmm_for_local_experts(x, routing, route_metadata)
-        output0, output1 = gmm_up(x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather, mask=mask)
+        output0, output1 = gmm_up(
+            x,
+            w0,
+            w1,
+            w0_bias,
+            w1_bias,
+            gmm_fn,
+            weight_gather,
+            mask=mask,
+            wi_0_a=wi_0_a,
+            wi_0_b=wi_0_b,
+            wi_1_a=wi_1_a,
+            wi_1_b=wi_1_b,
+        )
 
       intermediate_layer = self.apply_ffn_activation(output0, output1)
       wo_gather_axes, wo_tile_size = get_wo_gmm_params()
@@ -2396,6 +2552,17 @@ class RoutedMoE(nnx.Module):
           tiling=wo_tile_size,
           weight_gather_axes=wo_gather_axes,
       )
+      if wo_a is not None:
+        lora_gather_axes, lora_tile_size = get_wo_lora_gmm_params()
+        intermediate_output = intermediate_output + _sparse_expert_lora_down(
+            intermediate_layer,
+            wo_a,
+            wo_b,
+            gmm_fn=gmm_fn,
+            tiling=lora_tile_size,
+            weight_gather_axes=lora_gather_axes,
+            scale=sparse_expert_lora_scale,
+        )
       if self.get_tensor_parallelism_size() > 1:
         intermediate_output = jax.lax.psum_scatter(
             intermediate_output,
@@ -2483,6 +2650,12 @@ class RoutedMoE(nnx.Module):
             w0_bias_pspec,
             w1_bias_pspec,
             wo_bias_pspec,
+            wi_lora_a_pspec,
+            wi_lora_b_pspec,
+            wi_lora_a_pspec,
+            wi_lora_b_pspec,
+            wo_lora_a_pspec,
+            wo_lora_b_pspec,
             decoder_tokens_pspec,
             P(),  # Replicate the input key
             # Reuse gate_logits_pspec (which forced_routed_experts is sharded
@@ -2507,6 +2680,12 @@ class RoutedMoE(nnx.Module):
         w0_bias,
         w1_bias,
         wo_bias,
+        wi_0_a,
+        wi_0_b,
+        wi_1_a,
+        wi_1_b,
+        wo_a,
+        wo_b,
         sharded_input_ids,
         rngs,
         forced_routed_experts=None,
@@ -2529,7 +2708,13 @@ class RoutedMoE(nnx.Module):
             wo_bias,
             sharded_input_ids,
             rngs,
-            forced_routed_experts,
+            wi_0_a=wi_0_a,
+            wi_0_b=wi_0_b,
+            wi_1_a=wi_1_a,
+            wi_1_b=wi_1_b,
+            wo_a=wo_a,
+            wo_b=wo_b,
+            forced_routed_experts=forced_routed_experts,
         )
 
       # Chunked ring-of-experts pipeline: split the per-shard tokens along the
@@ -2564,7 +2749,13 @@ class RoutedMoE(nnx.Module):
             wo_bias,
             None if sharded_input_ids is None else sharded_input_ids[:, sl],
             rngs,
-            None if forced_routed_experts is None else forced_routed_experts[:, sl, :],
+            wi_0_a=wi_0_a,
+            wi_0_b=wi_0_b,
+            wi_1_a=wi_1_a,
+            wi_1_b=wi_1_b,
+            wo_a=wo_a,
+            wo_b=wo_b,
+            forced_routed_experts=(None if forced_routed_experts is None else forced_routed_experts[:, sl, :]),
         )
         if self.config.moe_chunk_barrier:
           _prev = out_c
@@ -2623,6 +2814,13 @@ class RoutedMoE(nnx.Module):
     w0_kernel = self._maybe_shard_with_pspec(w0_kernel, w0_pspec)
     w1_kernel = self._maybe_shard_with_pspec(w1_kernel, w1_pspec)
     wo_kernel = self._maybe_shard_with_pspec(wo_kernel, wo_pspec)
+    if has_sparse_expert_lora:
+      wi_0_lora_a = self._maybe_shard_with_pspec(wi_0_lora_a, wi_lora_a_pspec)
+      wi_0_lora_b = self._maybe_shard_with_pspec(wi_0_lora_b, wi_lora_b_pspec)
+      wi_1_lora_a = self._maybe_shard_with_pspec(wi_1_lora_a, wi_lora_a_pspec)
+      wi_1_lora_b = self._maybe_shard_with_pspec(wi_1_lora_b, wi_lora_b_pspec)
+      wo_lora_a = self._maybe_shard_with_pspec(wo_lora_a, wo_lora_a_pspec)
+      wo_lora_b = self._maybe_shard_with_pspec(wo_lora_b, wo_lora_b_pspec)
     if w0_bias is not None:
       w0_bias = self._maybe_shard_with_pspec(w0_bias, w0_bias_pspec)
     if w1_bias is not None:
@@ -2640,6 +2838,12 @@ class RoutedMoE(nnx.Module):
         w0_bias,
         w1_bias,
         wo_bias,
+        wi_0_lora_a,
+        wi_0_lora_b,
+        wi_1_lora_a,
+        wi_1_lora_b,
+        wo_lora_a,
+        wo_lora_b,
         input_ids,
         self.rngs,
         forced_routed_experts,
@@ -3439,6 +3643,35 @@ class RoutedMoE(nnx.Module):
     else:
       w0_bias, w1_bias, wo_bias = None, None, None
 
+    sparse_lora_names = (
+        "wi_0_lora_a",
+        "wi_0_lora_b",
+        "wi_1_lora_a",
+        "wi_1_lora_b",
+        "wo_lora_a",
+        "wo_lora_b",
+    )
+    present_sparse_lora_names = [name for name in sparse_lora_names if hasattr(self, name)]
+    if present_sparse_lora_names and len(present_sparse_lora_names) != len(sparse_lora_names):
+      raise ValueError(f"Incomplete sparse expert LoRA factors: {present_sparse_lora_names}")
+    if present_sparse_lora_names:
+      sparse_lora_factors = tuple(jnp.asarray(getattr(self, name)[...], self.dtype) for name in sparse_lora_names)
+      # Checkpoints keep the MaxText/Qwix-compatible B layout (R,E,F).
+      # Grouped matmul consumes (E,R,F); this transpose is a layout view and
+      # keeps the serialized sidecar contract independent of the GMM API.
+      sparse_lora_factors = (
+          sparse_lora_factors[0],
+          jnp.transpose(sparse_lora_factors[1], (1, 0, 2)),
+          sparse_lora_factors[2],
+          jnp.transpose(sparse_lora_factors[3], (1, 0, 2)),
+          sparse_lora_factors[4],
+          sparse_lora_factors[5],
+      )
+      sparse_lora_scale = float(self.sparse_expert_lora_scale)
+    else:
+      sparse_lora_factors = (None,) * len(sparse_lora_names)
+      sparse_lora_scale = 0.0
+
     # vllm_rpa codepath uses fused_moe_func from tpu_inference for optimized inference.
     # The fused MoE kernel currently only supports standard Top-K routing with associated
     # weights. Hash routed layers bypass this kernel and fall back
@@ -3476,6 +3709,8 @@ class RoutedMoE(nnx.Module):
           w0_bias,
           w1_bias,
           wo_bias,
+          *sparse_lora_factors,
+          sparse_expert_lora_scale=sparse_lora_scale,
           input_ids=input_ids,
           forced_routed_experts=forced_routed_experts,
       )

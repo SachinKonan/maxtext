@@ -17,6 +17,7 @@
 from collections.abc import Mapping
 from functools import partial
 import json
+import math
 import os
 import re
 from typing import Optional
@@ -53,9 +54,161 @@ from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
 from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR
+from maxtext.utils.sharding import create_sharding
 
 # NNX-only imports (train_state_nnx, model_creation_utils) are loaded lazily
 # inside the NNX dispatch branches so the Linen-only flow doesn't pull them in.
+
+
+_SPARSE_EXPERT_LORA_FACTOR_NAMES = (
+    "wi_0_lora_a",
+    "wi_0_lora_b",
+    "wi_1_lora_a",
+    "wi_1_lora_b",
+    "wo_lora_a",
+    "wo_lora_b",
+)
+
+
+def install_sparse_expert_lora(
+    model: nnx.Module,
+    *,
+    rank: int,
+    alpha: float,
+    rngs: nnx.Rngs,
+) -> int:
+  """Installs trainable LoRA factors on sparse ``RoutedMoE`` modules.
+
+  Qwix wraps dot/einsum modules, but a sparse MoE's expert projections are raw
+  parameters consumed by a grouped-matmul custom primitive.  Consequently a
+  module-path match alone cannot create expert adapters.  This helper adds an
+  explicit asymmetric factorization that ``RoutedMoE.sparse_matmul`` consumes
+  without ever materializing a dense expert-weight delta::
+
+    wi delta[e, d, f] = A[d, r] @ B[r, e, f]
+    wo delta[e, f, d] = A[e, f, r] @ B[r, d]
+
+  The factor layout intentionally shares the smaller factor over experts.  It
+  also preserves the scan axis and logical sharding metadata of already-scanned
+  MaxText layers, so callers may install adapters after checkpoint loading.
+
+  Args:
+    model: A pure-NNX MaxText model (or a wrapper containing one).
+    rank: Adapter rank, which must be positive.
+    alpha: LoRA alpha; the sparse path applies ``alpha / rank``.
+    rngs: RNG stream used for the A-factor initialization.
+
+  Returns:
+    Number of sparse RoutedMoE modules adapted.
+  """
+  if rank <= 0:
+    raise ValueError(f"Sparse expert LoRA rank must be positive, got {rank}")
+
+  def _stored_layout(
+      logical_shape: tuple[int, ...],
+      logical_axes: tuple[Optional[str], ...],
+      *,
+      scan_axis: Optional[int],
+      scan_size: Optional[int],
+      scan_name: Optional[str],
+  ) -> tuple[tuple[int, ...], tuple[Optional[str], ...], dict]:
+    shape = list(logical_shape)
+    axes = list(logical_axes)
+    metadata = {}
+    if scan_axis is not None:
+      shape.insert(scan_axis, scan_size)
+      axes.insert(scan_axis, scan_name)
+      metadata[nnx.PARTITION_NAME] = scan_name
+      metadata["param_scan_axis"] = scan_axis
+    return tuple(shape), tuple(axes), metadata
+
+  def _factor(
+      logical_shape: tuple[int, ...],
+      logical_axes: tuple[Optional[str], ...],
+      *,
+      random_init: bool,
+      fan_in: int,
+      dtype: jnp.dtype,
+      scan_axis: Optional[int],
+      scan_size: Optional[int],
+      scan_name: Optional[str],
+      mesh: jax.sharding.Mesh,
+      logical_axis_rules,
+  ) -> nnx.LoRAParam:
+    shape, axes, metadata = _stored_layout(
+        logical_shape,
+        logical_axes,
+        scan_axis=scan_axis,
+        scan_size=scan_size,
+        scan_name=scan_name,
+    )
+    if random_init:
+      value = jax.random.normal(rngs.params(), shape, dtype=dtype) / math.sqrt(fan_in)
+    else:
+      value = jnp.zeros(shape, dtype=dtype)
+    sharding = create_sharding(mesh, axes, rules=logical_axis_rules)
+    value = jax.make_array_from_callback(value.shape, sharding, lambda index: value[index])
+    return nnx.LoRAParam(value, out_sharding=axes, sparse_expert_lora=True, **metadata)
+
+  installed = 0
+  for path, module in nnx.iter_modules(model):
+    if module.__class__.__name__ != "RoutedMoE":
+      continue
+    config = getattr(module, "config", None)
+    if config is None or not getattr(config, "sparse_matmul", False):
+      continue
+    if getattr(config, "prefuse_moe_weights", False):
+      raise ValueError("Sparse expert LoRA does not support prefuse_moe_weights=True")
+    if not all(hasattr(module, name) for name in ("wi_0", "wi_1", "wo")):
+      continue
+    already_present = [name for name in _SPARSE_EXPERT_LORA_FACTOR_NAMES if hasattr(module, name)]
+    if already_present:
+      raise ValueError(f"Sparse expert LoRA is already installed at {'/'.join(map(str, path))}: {already_present}")
+
+    wi_metadata = module.wi_0.get_metadata()
+    scan_axis = wi_metadata.get("param_scan_axis")
+    scan_size = module.wi_0.shape[scan_axis] if scan_axis is not None else None
+    scan_name = wi_metadata.get(nnx.PARTITION_NAME, "layers") if scan_axis is not None else None
+    wi_shape = list(module.wi_0.shape)
+    wo_shape = list(module.wo.shape)
+    if scan_axis is not None:
+      del wi_shape[scan_axis]
+      del wo_shape[scan_axis]
+    num_experts, embed_dim, mlp_dim = wi_shape
+    if tuple(wo_shape) != (num_experts, mlp_dim, embed_dim):
+      raise ValueError(
+          f"Unexpected sparse expert shapes at {'/'.join(map(str, path))}: " f"wi={tuple(wi_shape)}, wo={tuple(wo_shape)}"
+      )
+    dtype = module.wi_0.dtype
+    common = dict(
+        dtype=dtype,
+        scan_axis=scan_axis,
+        scan_size=scan_size,
+        scan_name=scan_name,
+        mesh=module.mesh,
+        logical_axis_rules=module.config.logical_axis_rules,
+    )
+
+    # Up projections share A over experts and initialize B to zero.  The down
+    # projection uses the transposed asymmetric layout: expert A, shared B.
+    module.wi_0_lora_a = _factor((embed_dim, rank), ("embed_moe", None), random_init=True, fan_in=embed_dim, **common)
+    module.wi_0_lora_b = _factor(
+        (rank, num_experts, mlp_dim), (None, "exp", "mlp_moe"), random_init=False, fan_in=rank, **common
+    )
+    module.wi_1_lora_a = _factor((embed_dim, rank), ("embed_moe", None), random_init=True, fan_in=embed_dim, **common)
+    module.wi_1_lora_b = _factor(
+        (rank, num_experts, mlp_dim), (None, "exp", "mlp_moe"), random_init=False, fan_in=rank, **common
+    )
+    module.wo_lora_a = _factor(
+        (num_experts, mlp_dim, rank), ("exp", "mlp_moe", None), random_init=True, fan_in=mlp_dim, **common
+    )
+    module.wo_lora_b = _factor((rank, embed_dim), (None, "embed_moe"), random_init=False, fan_in=rank, **common)
+    module.sparse_expert_lora_scale = float(alpha) / rank
+    installed += 1
+
+  if installed == 0:
+    raise ValueError("No sparse RoutedMoE modules were found for expert LoRA")
+  return installed
 
 
 def apply_lora_on_base_params(base_params, lora_params, lora_scale_factor=1.0):
@@ -626,6 +779,13 @@ def apply_lora_to_model(
   lora_provider = _build_lora_provider(mt_config)
 
   model_rngs = getattr(model.decoder, "rngs", None)  # pyrefly: ignore[missing-attribute]
+  if mt_config.model_name.lower().startswith("gpt-oss") and mt_config.sparse_matmul:
+    install_sparse_expert_lora(
+        model,
+        rank=mt_config.lora.lora_rank,
+        alpha=mt_config.lora.lora_alpha,
+        rngs=model_rngs if model_rngs is not None else nnx.Rngs(0),
+    )
   decoder_input_tokens, decoder_positions = _prepare_dummy_inputs(mesh)
 
   lora_model = qwix.apply_lora_to_model(
@@ -646,7 +806,7 @@ def apply_lora_to_model(
       # We handle explicit replication for LoRA to ensure safety and efficiency.
       state = jax.tree_util.tree_map(
           lambda x: x.replace(sharding=jax.sharding.PartitionSpec(), out_sharding=None, sharding_names=None)
-          if isinstance(x, nnx.LoRAParam)
+          if isinstance(x, nnx.LoRAParam) and not x.get_metadata().get("sparse_expert_lora", False)
           else x,
           state,
           is_leaf=lambda x: isinstance(x, nnx.Variable),
