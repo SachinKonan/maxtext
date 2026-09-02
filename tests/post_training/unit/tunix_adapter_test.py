@@ -20,6 +20,7 @@ from unittest import mock
 
 import pytest
 
+from flax import nnx
 import jax.numpy as jnp
 import numpy as np
 
@@ -48,6 +49,24 @@ class _CallableStubBase:
     # Return dummy logits shaped [B, L, V=2] so the adapter has something to forward.
     b, l = decoder_input_tokens.shape
     return jnp.zeros((b, l, 2), dtype=jnp.float32)
+
+
+class _TiledStubDecoder(nnx.Module):
+  def record_hidden(self, hidden):
+    self.sow(nnx.Intermediate, "hidden_states", hidden)
+
+
+class _TiledStubBase(nnx.Module):
+  """Mimics MaxText's vocabulary-tiling output contract."""
+
+  def __init__(self):
+    self.config = SimpleNamespace(model_name=_STUB_MODEL_NAME)
+    self.decoder = _TiledStubDecoder()
+
+  def __call__(self, *, decoder_input_tokens, **_kwargs):
+    hidden = jnp.repeat(decoder_input_tokens[..., None], 3, axis=-1)
+    self.decoder.record_hidden(hidden)
+    return None
 
 
 class TunixAdapterSegmentIdsTest(unittest.TestCase):
@@ -158,6 +177,35 @@ class TunixAdapterSegmentIdsTest(unittest.TestCase):
     logits, second = result
     self.assertIsNone(second)
     self.assertEqual(logits.shape, (1, 5, 2))
+
+  def test_returns_sown_hidden_state_when_explicitly_requested(self):
+    adapter = TunixMaxTextAdapter(base_model=_TiledStubBase(), pad_id=None)
+    input_tokens = jnp.array([[10, 11, 12]], dtype=jnp.int32)
+    positions = jnp.arange(3, dtype=jnp.int32)[None, :]
+
+    hidden, second = adapter(
+        input_tokens,
+        positions,
+        None,
+        None,
+        output_hidden_states=True,
+    )
+
+    self.assertIsNone(second)
+    np.testing.assert_array_equal(
+        np.asarray(hidden),
+        np.repeat(np.asarray(input_tokens)[..., None], 3, axis=-1),
+    )
+
+  def test_keeps_none_sentinel_when_hidden_state_not_requested(self):
+    adapter = TunixMaxTextAdapter(base_model=_TiledStubBase(), pad_id=None)
+    input_tokens = jnp.array([[10, 11, 12]], dtype=jnp.int32)
+    positions = jnp.arange(3, dtype=jnp.int32)[None, :]
+
+    logits, second = adapter(input_tokens, positions, None, None)
+
+    self.assertIsNone(logits)
+    self.assertIsNone(second)
 
 
 if __name__ == "__main__":

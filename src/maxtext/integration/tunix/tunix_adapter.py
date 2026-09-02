@@ -107,7 +107,7 @@ class TunixMaxTextAdapter(nnx.Module):
       cache: Optional[Any],  # Tunix currently passes None from Trainers
       attention_mask: Optional[Array],  # [B, L, L] or None
       decoder_segment_ids: Optional[Array] = None,
-      output_hidden_states: bool = False,  # ignored
+      output_hidden_states: bool = False,
       forced_routed_experts: Optional[Array] = None,
   ) -> Tuple[Array, None]:
     """Forward compatible with Tunix Trainers default loss.
@@ -121,6 +121,23 @@ class TunixMaxTextAdapter(nnx.Module):
         decoder_segment_ids=decoder_segment_ids,
         forced_routed_experts=forced_routed_experts,
     )
+    if output_hidden_states and logits is None:
+      # With vocabulary tiling enabled, the MaxText decoder deliberately skips
+      # the full vocabulary projection and sows its final hidden state instead.
+      # Tunix callers that explicitly request hidden states need that tensor,
+      # not the ``None`` logits sentinel.  Keep the Intermediate in module state
+      # so the surrounding lifted transform can account for the mutation; the
+      # trainer owns clearing it after consuming the result.
+      intermediates = nnx.state(self.base.decoder, nnx.Intermediate)
+      try:
+        hidden_states = intermediates["hidden_states"].get_value()
+      except KeyError as exc:
+        raise ValueError(
+            "output_hidden_states=True but MaxText did not sow decoder hidden_states"
+        ) from exc
+      if not hidden_states:
+        raise ValueError("MaxText decoder sowed an empty hidden_states collection")
+      logits = hidden_states[-1]
     return logits, None
 
   def to_hf_mappings(self):
