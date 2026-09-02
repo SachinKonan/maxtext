@@ -242,7 +242,7 @@ class LazyTensor:
   def itemsize(self):
     return self.dtype.itemsize
 
-  def __array__(self, dtype=None):
+  def __array__(self, dtype=None, copy=None):
     """
     Materializes the tensor data.
 
@@ -267,7 +267,9 @@ class LazyTensor:
       arr = np.array(arr)
 
     if dtype is not None and arr.dtype != dtype:
-      return arr.astype(dtype)
+      arr = arr.astype(dtype, copy=False)
+    if copy is True:
+      return arr.copy()
     return arr
 
   def __repr__(self):
@@ -287,7 +289,9 @@ class LazyTensorHandler(type_handlers.NumpyHandler):
     # MATERIALIZE: Trigger the lazy load (__array__) explicitly before saving.
     # This ensures the parent NumpyHandler receives a real np.ndarray.
     if hasattr(value, "__array__"):
-      value = np.array(value)
+      # np.array() defaults to copy=True.  For scanned MoE checkpoints that
+      # doubled the live memory of an already-tens-of-GB materialized tensor.
+      value = np.asarray(value)
 
     return await super().serialize(value, *args, **kwargs)
 
@@ -429,8 +433,6 @@ def _build_single_axis_stacked_tensor(
   Returns:
       The final, assembled NumPy array for the MaxText parameter.
   """
-  tensors_to_stack = []
-
   if config.scan_layers:
     # If it's a standard scanned layer, we use the configured param_scan_axis.
     axis_to_stack = config.param_scan_axis
@@ -444,16 +446,28 @@ def _build_single_axis_stacked_tensor(
   del mt_slice_shape_list[axis_to_stack]
   mt_slice_shape = tuple(mt_slice_shape_list)
 
-  for hf_key_single in hf_source_keys:
+  stacked = None
+  for stack_index, hf_key_single in enumerate(hf_source_keys):
     if isinstance(hf_key_single, (list, tuple)):
       hf_tensor_numpy = tuple(tensor_getter_fn(k) for k in hf_key_single)
     else:
       hf_tensor_numpy = tensor_getter_fn(hf_key_single)
     processed_hf_tensor = apply_hook_fns(hf_tensor_numpy, mt_slice_shape, hook_fns)
-    tensors_to_stack.append(processed_hf_tensor)
+    if stacked is None:
+      normalized_axis = axis_to_stack % (processed_hf_tensor.ndim + 1)
+      stacked_shape = list(processed_hf_tensor.shape)
+      stacked_shape.insert(normalized_axis, len(hf_source_keys))
+      # Fill the final array incrementally. Keeping every processed layer in a
+      # list and then calling np.stack() retained one full model tensor while
+      # allocating a second full tensor (over 150 GB for GPT-OSS 120B gate/up).
+      stacked = np.empty(stacked_shape, dtype=processed_hf_tensor.dtype)
+    index = [slice(None)] * stacked.ndim
+    index[normalized_axis] = stack_index
+    stacked[tuple(index)] = processed_hf_tensor
 
-  # Stack all processed tensors along the determined axis.
-  return np.stack(tensors_to_stack, axis=axis_to_stack)
+  if stacked is None:
+    raise ValueError("Cannot stack an empty Hugging Face key list.")
+  return stacked
 
 
 def _get_hf_loading_function(hf_source_keys_or_key, tensor_getter, hook_fn, mt_target_shape_or_shapes, config, mt_key=""):
@@ -603,7 +617,9 @@ def _get_maxtext_weight(
       for i, mt_target_idx in enumerate(mt_target_idx_or_indices):
 
         def _slicing_loader(base_loader, slice_idx):
-          return np.array(base_loader)[..., slice_idx]
+          # np.asarray() preserves the materialized base buffer. np.array()
+          # copied it before slicing, adding another ~76 GB for 120B gate/up.
+          return np.asarray(base_loader)[..., slice_idx]
 
         # Each LazyTensor gets a new load_fn that wraps the original and applies the slice.
         slicing_load_fn = partial(_slicing_loader, final_mt_tensor_numpy, i)
