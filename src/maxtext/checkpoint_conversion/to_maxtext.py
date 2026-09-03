@@ -385,29 +385,46 @@ def _build_multi_axis_stacked_tensor(
     outer_axis, inner_axis = config.param_scan_axis, config.param_scan_axis + 1
   else:
     outer_axis, inner_axis = 0, 1
+  outer_axis %= len(target_shape)
+  inner_axis %= len(target_shape)
+  if outer_axis == inner_axis:
+    raise ValueError(f"Stack axes must be distinct, got {outer_axis} twice.")
 
   # The hook function needs the shape of an individual slice: target_shape with
   # the two stacked axes removed.
   stacked_axes = {outer_axis, inner_axis}
   mt_slice_shape = tuple(d for i, d in enumerate(target_shape) if i not in stacked_axes)
 
-  all_outer_tensors = []
+  if len(hf_source_keys) != target_shape[outer_axis]:
+    raise ValueError(f"Expected {target_shape[outer_axis]} outer source groups, got {len(hf_source_keys)}.")
+
+  stacked = None
   # Outer loop iterates the outer stack axis (experts, or blocks for gemma4 local)
-  for inner_keys in hf_source_keys:
-    inner_tensors = []
+  for outer_index, inner_keys in enumerate(hf_source_keys):
+    if len(inner_keys) != target_shape[inner_axis]:
+      raise ValueError(
+          f"Expected {target_shape[inner_axis]} inner sources for group {outer_index}, got {len(inner_keys)}."
+      )
     # Inner loop iterates the inner stack axis (layers, or local layers for gemma4)
-    for hf_key_single in inner_keys:
+    for inner_index, hf_key_single in enumerate(inner_keys):
       if isinstance(hf_key_single, (list, tuple)):
         hf_tensor_numpy = tuple(tensor_getter_fn(k) for k in hf_key_single)
       else:
         hf_tensor_numpy = tensor_getter_fn(hf_key_single)
-      inner_tensors.append(apply_hook_fns(hf_tensor_numpy, mt_slice_shape, hook_fns))
-    all_outer_tensors.append(np.stack(inner_tensors, axis=0))
-  stacked = np.stack(all_outer_tensors, axis=0)  # (outer, inner, *slice)
+      processed_hf_tensor = apply_hook_fns(hf_tensor_numpy, mt_slice_shape, hook_fns)
+      if stacked is None:
+        # Fill the final tensor directly. Retaining per-layer arrays, stacking
+        # them per expert, and then stacking every expert made two additional
+        # full-size allocations for scanned MoE checkpoints (over 256 GiB RSS
+        # for GPT-OSS 120B).
+        stacked = np.empty(target_shape, dtype=processed_hf_tensor.dtype)
+      index = [slice(None)] * stacked.ndim
+      index[outer_axis] = outer_index
+      index[inner_axis] = inner_index
+      stacked[tuple(index)] = processed_hf_tensor
 
-  # Move the (outer, inner) axes from leading positions to their targets.
-  if (outer_axis, inner_axis) != (0, 1):
-    stacked = np.moveaxis(stacked, (0, 1), (outer_axis, inner_axis))
+  if stacked is None:
+    raise ValueError("Cannot stack an empty nested Hugging Face key list.")
   return stacked
 
 
@@ -896,10 +913,8 @@ def main(
 
   # check the supported model ids
   if model_name_original not in HF_IDS:
-    raise ValueError(
-        f"Unsupported model name: {model_name_original}.\
-                      Supported models are: {list(HF_IDS.keys())}"
-    )
+    raise ValueError(f"Unsupported model name: {model_name_original}.\
+                      Supported models are: {list(HF_IDS.keys())}")
 
   model_id = hf_model_path or HF_IDS[model_name_original]
 

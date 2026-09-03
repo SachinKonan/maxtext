@@ -38,6 +38,54 @@ def test_single_axis_scan_fills_preallocated_result_without_np_stack():
   np.testing.assert_array_equal(result, expected)
 
 
+def test_multi_axis_scan_fills_preallocated_result_without_np_stack():
+  source = {
+      f"expert.{expert}.layer.{layer}": np.full((2, 3), expert * 10 + layer, dtype=np.float32)
+      for expert in range(2)
+      for layer in range(3)
+  }
+  keys = [[f"expert.{expert}.layer.{layer}" for layer in range(3)] for expert in range(2)]
+  config = SimpleNamespace(scan_layers=True, param_scan_axis=1)
+
+  with mock.patch.object(np, "stack", side_effect=AssertionError("full-size copy")):
+    result = to_maxtext._build_multi_axis_stacked_tensor(keys, source.__getitem__, None, (2, 3, 2, 3), config)
+
+  expected = np.empty((2, 3, 2, 3), dtype=np.float32)
+  for expert in range(2):
+    for layer in range(3):
+      expected[expert, layer] = source[f"expert.{expert}.layer.{layer}"]
+  np.testing.assert_array_equal(result, expected)
+
+
+def test_nested_gemma_scan_fills_nonleading_axes_without_np_stack_or_moveaxis():
+  source = {
+      f"block.{block}.layer.{layer}": np.full((2, 3), block * 10 + layer, dtype=np.float32)
+      for block in range(2)
+      for layer in range(3)
+  }
+  keys = [[f"block.{block}.layer.{layer}" for layer in range(3)] for block in range(2)]
+  config = SimpleNamespace(scan_layers=True, param_scan_axis=1)
+
+  with (
+      mock.patch.object(np, "stack", side_effect=AssertionError("full-size copy")),
+      mock.patch.object(np, "moveaxis", side_effect=AssertionError("full-size view")),
+  ):
+    result = to_maxtext._build_multi_axis_stacked_tensor(
+        keys,
+        source.__getitem__,
+        None,
+        (2, 2, 3, 3),
+        config,
+        "params-decoder-scanned_blocks-local_layers-test",
+    )
+
+  expected = np.empty((2, 2, 3, 3), dtype=np.float32)
+  for block in range(2):
+    for layer in range(3):
+      expected[:, block, layer, :] = source[f"block.{block}.layer.{layer}"]
+  np.testing.assert_array_equal(result, expected)
+
+
 def test_lazy_composite_slice_does_not_call_copying_np_array():
   source = np.arange(24, dtype=np.float32).reshape(3, 4, 2)
   final_weights = [None, None]
